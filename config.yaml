@@ -1,0 +1,23 @@
+﻿paths:
+  datasets: "datasets"
+  outputs: "outputs"
+
+manifests:
+  img_exts: [".jpg", ".jpeg", ".png"]
+  random_seed: 42
+  hamming_threshold: 6
+
+training:
+  img_size: 224
+  batch_size: 32
+  epochs: 15
+  lr: 0.0003
+
+ablation:
+  use_augmentation: true
+  use_pretrained_weights: true
+  use_class_weighting: true
+
+water_quality:
+  n_per_species: 3000
+  label_noise_rate: 0.07

@@ -1,0 +1,25 @@
+# 1. Generate a standard .gitignore file for PyTorch & Python environments
+@"
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Heavy Output Artifacts & Checkpoints (Keep structure, ignore raw output weights)
+outputs/experiments/*/best_model.pth
+outputs/experiments/*/best_fusion_model.pth
+data/raw/*
+!data/raw/.gitkeep
