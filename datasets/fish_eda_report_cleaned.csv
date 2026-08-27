@@ -1,0 +1,10 @@
+label,original_count,clean_count,augmented_count,aug_percent,removed_duplicates
+Bacterial Red disease,400,307,188,61.2,93
+Bacterial diseases - Aeromoniasis,400,311,144,46.3,89
+Bacterial gill disease,400,322,129,40.1,78
+EUS,400,309,109,35.3,91
+Fungal diseases Saprolegniasis,400,266,180,67.7,134
+Healthy Fish,400,329,122,37.1,71
+Parasitic diseases,400,302,171,56.6,98
+Viral diseases White tail disease,400,282,178,63.1,118
+test_split,303,303,0,0.0,0

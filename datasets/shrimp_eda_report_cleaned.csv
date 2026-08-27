@@ -1,0 +1,5 @@
+label,original_count,clean_count,augmented_count,aug_percent,removed_duplicates
+BG,698,417,256,61.4,281
+Healthy,903,391,83,21.2,512
+WSSV,828,369,147,39.8,459
+WSSV_BG,720,327,189,57.8,393

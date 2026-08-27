@@ -1,154 +1,86 @@
-﻿import hashlib
+﻿import os
 from pathlib import Path
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from config import load_config
 
+def find_species_dir(base_paths, species_name: str) -> Path:
+    """Finds existing species directory across common dataset folder structures."""
+    for base in base_paths:
+        if base is None:
+            continue
+        base = Path(base)
+        # Direct check: root/species
+        candidate = base / species_name
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+        # Nested check: root/raw/species
+        candidate_raw = base / "raw" / species_name
+        if candidate_raw.exists() and candidate_raw.is_dir():
+            return candidate_raw
+    return None
 
-def hash_file(path: Path) -> str:
-    """Computes MD5 hash of an image file to catch exact byte duplicates."""
-    with open(path, "rb") as f:
-        return hashlib.md5(f.read()).hexdigest()
+def build_manifest_for_species(species_dir: Path, species_name: str) -> pd.DataFrame:
+    records = []
+    if species_dir is None or not species_dir.exists():
+        print(f"Warning: Directory for '{species_name}' could not be located.")
+        return pd.DataFrame()
 
+    valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-def build_fish_manifest(config) -> pd.DataFrame:
-    base_dir = config.paths.datasets / "fish" / "New Dataset"
-    train_dir = base_dir / "train_split"
-    test_dir = base_dir / "test_split"
-    img_exts = tuple(config.manifests.img_exts)
-    seed = config.manifests.random_seed
+    for root, _, files in os.walk(species_dir):
+        for file in files:
+            ext = Path(file).suffix.lower()
+            if ext in valid_exts:
+                full_path = Path(root) / file
+                class_label = full_path.parent.name
+                
+                parts = [p.lower() for p in full_path.parts]
+                if "val" in parts or "validation" in parts:
+                    split = "val"
+                elif "test" in parts:
+                    split = "test"
+                else:
+                    split = "train"
 
-    rows, seen_hashes = [], set()
-    dropped_dupes = 0
+                is_aug = file.lower().startswith("aug_") or "_aug_" in file.lower()
 
-    if train_dir.exists():
-        for cls_dir in sorted(train_dir.iterdir()):
-            if not cls_dir.is_dir():
-                continue
-            for fpath in cls_dir.iterdir():
-                if fpath.suffix.lower() not in img_exts:
-                    continue
-                h = hash_file(fpath)
-                if h in seen_hashes:
-                    dropped_dupes += 1
-                    continue
-                seen_hashes.add(h)
-                rows.append(
-                    {
-                        "image_path": str(fpath.resolve()),
-                        "label": cls_dir.name,
-                        "dataset": "fish",
-                        "split": "train_full",
-                    }
-                )
+                records.append({
+                    "image_path": str(full_path.resolve()),
+                    "label": class_label,
+                    "species": species_name,
+                    "split": split,
+                    "is_augmented": is_aug
+                })
 
-    class_names = (
-        [d.name for d in sorted(train_dir.iterdir()) if d.is_dir()]
-        if train_dir.exists()
-        else []
-    )
-    test_rows = []
-
-    if test_dir.exists():
-        for fpath in test_dir.iterdir():
-            if fpath.suffix.lower() not in img_exts:
-                continue
-            matched = next(
-                (cls for cls in class_names if fpath.name.startswith(cls)), None
-            )
-            if matched:
-                test_rows.append(
-                    {
-                        "image_path": str(fpath.resolve()),
-                        "label": matched,
-                        "dataset": "fish",
-                        "split": "test",
-                    }
-                )
-
-    df_train_full = pd.DataFrame(rows)
-    if not df_train_full.empty:
-        train_idx, val_idx = train_test_split(
-            df_train_full.index,
-            test_size=0.15,
-            stratify=df_train_full["label"],
-            random_state=seed,
-        )
-        df_train_full.loc[train_idx, "split"] = "train"
-        df_train_full.loc[val_idx, "split"] = "val"
-
-    df_test = pd.DataFrame(test_rows)
-    df_fish = pd.concat([df_train_full, df_test], ignore_index=True)
-    return df_fish
-
-
-def build_shrimp_manifest(config) -> pd.DataFrame:
-    shrimp_dir = config.paths.datasets / "shrimp" / "ShrimpImages" / "ShrimpImages"
-    img_exts = tuple(config.manifests.img_exts)
-    seed = config.manifests.random_seed
-
-    rows = []
-    if shrimp_dir.exists():
-        for cls_dir in sorted(shrimp_dir.iterdir()):
-            if not cls_dir.is_dir():
-                continue
-            for fpath in cls_dir.iterdir():
-                if fpath.suffix.lower() not in img_exts:
-                    continue
-                rows.append(
-                    {
-                        "image_path": str(fpath.resolve()),
-                        "label": cls_dir.name,
-                        "dataset": "shrimp",
-                    }
-                )
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        train_idx, temp_idx = train_test_split(
-            df.index, test_size=0.30, stratify=df["label"], random_state=seed
-        )
-        temp_df = df.loc[temp_idx]
-        val_idx, test_idx = train_test_split(
-            temp_idx,
-            test_size=0.50,
-            stratify=temp_df["label"],
-            random_state=seed,
-        )
-
-        df["split"] = ""
-        df.loc[train_idx, "split"] = "train"
-        df.loc[val_idx, "split"] = "val"
-        df.loc[test_idx, "split"] = "test"
-
+    df = pd.DataFrame(records)
+    print(f"[{species_name.capitalize()}] Found {len(df)} images across {df['label'].nunique() if not df.empty else 0} classes.")
     return df
 
-
 def run(config):
-    """Entry point: processes fish & shrimp datasets and writes manifest CSVs."""
-    out_dir = config.paths.datasets / "manifests"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest_dir = Path("datasets/manifests")
+    if hasattr(config.paths, "datasets"):
+        manifest_dir = config.paths.datasets / "manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Candidate root folders to search
+    candidate_roots = [
+        Path("data"),
+        Path("datasets"),
+        getattr(config.paths, "datasets", None),
+        Path("."),
+    ]
 
-    df_fish = build_fish_manifest(config)
-    fish_out = out_dir / "fish_manifest.csv"
-    df_fish.to_csv(fish_out, index=False)
-
-    df_shrimp = build_shrimp_manifest(config)
-    shrimp_out = out_dir / "shrimp_manifest.csv"
-    df_shrimp.to_csv(shrimp_out, index=False)
-
-    return {
-        "fish_manifest_path": fish_out,
-        "shrimp_manifest_path": shrimp_out,
-        "fish_count": len(df_fish),
-        "shrimp_count": len(df_shrimp),
-    }
-
+    for species in ["fish", "shrimp"]:
+        species_dir = find_species_dir(candidate_roots, species)
+        if species_dir:
+            print(f"Located '{species}' folder at: {species_dir.resolve()}")
+        df_manifest = build_manifest_for_species(species_dir, species)
+        
+        if not df_manifest.empty:
+            out_file = manifest_dir / f"{species}_manifest.csv"
+            df_manifest.to_csv(out_file, index=False)
+            print(f"Saved regenerated manifest: {out_file}\n")
 
 if __name__ == "__main__":
-    from config import load_config
-
     cfg = load_config()
-    res = run(cfg)
-    print(
-        f"Manifests generated successfully:\n - Fish: {res['fish_manifest_path']} ({res['fish_count']} samples)\n - Shrimp: {res['shrimp_manifest_path']} ({res['shrimp_count']} samples)"
-    )
+    run(cfg)
