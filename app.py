@@ -1,54 +1,30 @@
-﻿import gradio as gr
+﻿import streamlit as st
+import cv2
 import numpy as np
-from config import load_config
+from PIL import Image
 from aquavision.predict import AquaPredictor
 
-cfg = load_config()
-predictor = AquaPredictor(cfg, dataset_type="fish")
+st.title("AquaVision BD — Diagnostic Dashboard")
 
-def analyze_aquaculture(image, ph, temp, do, salinity, ammonia, turbidity):
-    if image is None:
-        return "Please upload an image.", {}
+species = st.sidebar.selectbox("Select Species", ["fish", "shrimp"])
+predictor = AquaPredictor(species=species, fold=0)
 
-    predictions, top_pred, confidence = predictor.predict(
-        image, ph, temp, do, salinity, ammonia, turbidity
-    )
-    
-    # Generate action status recommendation based on water quality checks
-    alerts = []
-    if ph < 6.5 or ph > 8.5:
-        alerts.append(f"pH level ({ph}) is outside ideal range (6.5 - 8.5).")
-    if do < 5.0:
-        alerts.append(f"Low Dissolved Oxygen ({do} mg/L). Turn on aeration.")
-    if ammonia > 0.05:
-        alerts.append(f"High Ammonia ({ammonia} mg/L). Perform water exchange.")
+uploaded_file = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
 
-    status_msg = f"### Diagnosis: **{top_pred.upper()}** (Confidence: {confidence:.2%})\n\n"
-    if alerts:
-        status_msg += "**Water Quality Warnings:**\n" + "\n".join([f"- {a}" for a in alerts])
-    else:
-        status_msg += "Water quality parameters are within nominal operational ranges."
+st.sidebar.subheader("Water Quality Parameters")
+temp = st.sidebar.slider("Temperature (°C)", 15.0, 35.0, 25.0)
+ph = st.sidebar.slider("pH Level", 5.0, 10.0, 7.5)
+do = st.sidebar.slider("Dissolved Oxygen (mg/L)", 1.0, 10.0, 6.0)
+ammonia = st.sidebar.slider("Ammonia (mg/L)", 0.0, 3.0, 0.01)
 
-    return status_msg, predictions
+if uploaded_file is not None:
+    image = Image.open(uploaded_file)
+    img_array = np.array(image.convert("RGB"))
+    st.image(image, caption="Uploaded Image", use_container_width=True)
 
-demo = gr.Interface(
-    fn=analyze_aquaculture,
-    inputs=[
-        gr.Image(label="Fish Sample Image"),
-        gr.Slider(4.0, 10.0, value=7.2, step=0.1, label="pH Level"),
-        gr.Slider(15.0, 40.0, value=26.0, step=0.5, label="Temperature (°C)"),
-        gr.Slider(0.5, 12.0, value=6.5, step=0.1, label="Dissolved Oxygen (mg/L)"),
-        gr.Slider(0.0, 40.0, value=15.0, step=0.5, label="Salinity (ppt)"),
-        gr.Slider(0.0, 3.0, value=0.02, step=0.01, label="Ammonia (mg/L)"),
-        gr.Slider(1.0, 100.0, value=12.0, step=1.0, label="Turbidity (NTU)"),
-    ],
-    outputs=[
-        gr.Markdown(label="Diagnostic Results"),
-        gr.Label(num_top_classes=5, label="Class Probabilities"),
-    ],
-    title="AquaVision: AI-Powered Multimodal Aquaculture Diagnostics",
-    description="Upload a fish sample image and input real-time water parameters for joint vision-tabular disease classification.",
-)
-
-if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860)
+    if st.button("Run Diagnosis"):
+        wq_dict = {"temperature": temp, "ph": ph, "dissolved_oxygen": do, "ammonia": ammonia}
+        result = predictor.predict(img_array, water_quality_dict=wq_dict)
+        
+        st.success(f"**Prediction:** {result['prediction']}")
+        st.info(f"**Confidence:** {result['confidence']*100:.2f}%")

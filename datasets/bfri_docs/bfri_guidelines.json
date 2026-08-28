@@ -1,0 +1,22 @@
+﻿{
+  "Bacterial diseases - Aeromoniasis": {
+    "symptoms": "Hemorrhages on skin, body ulcers, exophthalmia (pop-eye), swollen abdomen.",
+    "bfri_treatment": "Apply Oxytetrasyline (50-75 mg/kg fish body weight) mixed with feed daily for 7-10 days. Disinfect pond with Lime (CaCO3) at 1 kg/decimal.",
+    "water_remediation": "Perform 30% water exchange. Increase dissolved oxygen above 5.0 mg/L."
+  },
+  "Bacterial gill disease": {
+    "symptoms": "Swollen and pale gills, excessive mucus secretion, piping at surface.",
+    "bfri_treatment": "Salt bath treatment (1-2% NaCl solution for 10-15 mins) or Potassium Permanganate (KMnO4) at 2-3 ppm whole pond treatment.",
+    "water_remediation": "Reduce organic load by clearing uneaten feed. Maintain ammonia below 0.05 mg/L."
+  },
+  "EUS": {
+    "symptoms": "Deep red necrotizing ulcers on head, body, and tail.",
+    "bfri_treatment": "Apply CIFAX at 1 liter/hectare (1 meter depth) or Lime (CaCO3) at 1 kg/decimal alongside Salt at 1 kg/decimal.",
+    "water_remediation": "Stabilize pH between 7.5 and 8.5. Avoid cold water stress."
+  },
+  "WSSV": {
+    "symptoms": "White spots/patches on carapace, reddish body discoloration, lethargy in shrimp.",
+    "bfri_treatment": "No cure for acute viral infection. Immediately isolate infected ponds using biological security barriers. Apply Probiotics to suppress viral spread.",
+    "water_remediation": "Disinfect intake water with Chlorine (30 ppm) before filling culture ponds. Maintain DO > 5.0 mg/L."
+  }
+}

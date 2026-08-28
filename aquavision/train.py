@@ -55,7 +55,7 @@ def evaluate(model, dataloader, device):
 
 def run_cross_validation(species: str = "fish", epochs: int = 25, patience: int = 5, min_epochs: int = 10, batch_size: int = 16, lr: float = 3e-4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n--- Running 5-Fold Cross-Validation: {species.upper()} (Max Epochs: {epochs}, Patience: {patience}) ---")
+    print(f"\n--- Running 5-Fold Cross-Validation: {species.upper()} ---")
 
     manifest_path = Path("datasets/processed") / f"{species}_processed_manifest.csv"
     if not manifest_path.exists():
@@ -63,25 +63,28 @@ def run_cross_validation(species: str = "fish", epochs: int = 25, patience: int 
         return
 
     df = pd.read_csv(manifest_path)
+    
+    # Strictly isolate train/val data (exclude fold == -1)
+    cv_df = df[df["fold"] >= 0].copy().reset_index(drop=True)
+
     unique_labels = sorted(df["label"].unique())
     label2idx = {lbl: idx for idx, lbl in enumerate(unique_labels)}
-    df["label_idx"] = df["label"].map(label2idx)
+    cv_df["label_idx"] = cv_df["label"].map(label2idx)
 
-    tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in df.columns]
+    tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in cv_df.columns]
     checkpoints_dir = Path("checkpoints")
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     fold_f1s = []
 
     for fold in range(5):
-        train_df = df[df["fold"] != fold].copy()
-        val_df = df[df["fold"] == fold].copy()
+        train_df = cv_df[cv_df["fold"] != fold].copy()
+        val_df = cv_df[cv_df["fold"] == fold].copy()
 
         if tab_cols:
             scaler = StandardScaler()
             train_df[tab_cols] = scaler.fit_transform(train_df[tab_cols].fillna(0.0))
             val_df[tab_cols] = scaler.transform(val_df[tab_cols].fillna(0.0))
-            # Save fold-specific scaler matching this fold's model state
             joblib.dump(scaler, checkpoints_dir / f"{species}_scaler_fold{fold}.pkl")
 
         train_ds = AquaDataset(train_df, is_train=True, species=species, tab_cols=tab_cols)
@@ -126,22 +129,9 @@ def run_cross_validation(species: str = "fish", epochs: int = 25, patience: int 
         fold_f1s.append(best_f1)
 
     mean_f1 = float(np.mean(fold_f1s))
-    var_f1 = float(np.var(fold_f1s))
     std_f1 = float(np.std(fold_f1s))
-
-    print(f"\n[{species.upper()} STATISTICAL SUMMARY]")
-    print(f"  - Fold F1 Scores : {[round(x, 4) for x in fold_f1s]}")
-    print(f"  - Mean Macro F1   : {mean_f1:.4f}")
-    print(f"  - F1 Variance     : {var_f1:.6f}")
-    print(f"  - F1 Std Dev      : {std_f1:.4f}")
-    print(f"  - Stability Check : {'STABLE' if std_f1 < 0.03 else 'UNSTABLE'}")
-
-def main():
-    print("="*50)
-    print(" CV RUN: PER-FOLD SCALER PERSISTENCE & LEAKAGE FIX")
-    print("="*50)
-    for species in ["fish", "shrimp"]:
-        run_cross_validation(species=species, epochs=25, patience=5, min_epochs=10)
+    print(f"[{species.upper()} STATISTICAL SUMMARY] Mean Macro F1: {mean_f1:.4f} (±{std_f1:.4f})")
 
 if __name__ == "__main__":
-    main()
+    for species in ["fish", "shrimp"]:
+        run_cross_validation(species=species, epochs=25, patience=5, min_epochs=10)
