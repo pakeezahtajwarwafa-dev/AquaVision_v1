@@ -5,7 +5,27 @@ from dedupe import deduplicate_split_group
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
+
+
+def carve_out_test_split(df: pd.DataFrame, test_size: float = 0.15, random_state: int = 42) -> pd.DataFrame:
+    """
+    For datasets that don't ship with their own held-out test folder (e.g.
+    shrimp), carve out a stratified test slice manually so every species gets
+    an honest, never-trained-on final evaluation set like fish already has.
+
+    Must be called AFTER deduplication, so the held-out rows are guaranteed
+    to not be near-duplicates of anything left in the training pool.
+    """
+    df = df.copy()
+    train_idx, test_idx = train_test_split(
+        df.index,
+        test_size=test_size,
+        stratify=df["label"],
+        random_state=random_state,
+    )
+    df.loc[test_idx, "is_test"] = True
+    return df
 
 
 def build_robust_manifest(species: str = "fish"):
@@ -64,12 +84,19 @@ def build_robust_manifest(species: str = "fish"):
         })
 
     df = pd.DataFrame(records)
-    
+
     # --- DEDUPLICATION START ---
     print(f"[{species.upper()}] Running perceptual deduplication...")
     df, dropped = deduplicate_split_group(df, max_hamming_dist=4)
     print(f"[{species.upper()}] Dropped {dropped} duplicate/downscaled images.")
     # --- DEDUPLICATION END ---
+
+    # --- TEST SPLIT CARVE-OUT (only if the raw data had no test_split folder) ---
+    if not df["is_test"].any():
+        print(f"[{species.upper()}] No native test_split found - carving out a stratified 15% held-out set.")
+        df = carve_out_test_split(df, test_size=0.15, random_state=42)
+    # -------------------------------------------------------------------------
+
     print(f"[{species.upper()}] Parsed {len(df)} images ({df['is_test'].sum()} held-out test samples)")
 
     # Assign K-Fold to training data, -1 to test set

@@ -1,86 +1,93 @@
-﻿import torch
+﻿import os
+import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, models
+from torchvision import models
+import cv2
 import pandas as pd
 from pathlib import Path
-from PIL import Image
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
-class CombinedSpeciesDataset(Dataset):
-    def __init__(self, df, transform=None):
-        self.df = df.reset_index(drop=True)
+class SpeciesGateDataset(Dataset):
+    def __init__(self, samples, transform=None):
+        self.samples = samples
         self.transform = transform
 
     def __len__(self):
-        return len(self.df)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        image = Image.open(row['image_path']).convert('RGB')
-        label = row['species_label'] # 0 for fish, 1 for shrimp
+        path, label = self.samples[idx]
+        img = cv2.imread(str(path))
+        if img is None:
+            # Fallback for unreadable images
+            img = np.zeros((224, 224, 3), dtype=np.uint8)
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img, (224, 224))
         if self.transform:
-            image = self.transform(image)
-        return image, label
+            img = self.transform(image=img)["image"]
+        return img, torch.tensor(label, dtype=torch.long)
 
 def train_gate():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Training Species Gate on device: {device}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training 3-Class Species & OOD Gate on device: {device}")
 
-    # Load clean manifests
-    fish_df = pd.read_csv('datasets/processed/fish_processed_manifest.csv')
-    shrimp_df = pd.read_csv('datasets/processed/shrimp_processed_manifest.csv')
+    samples = []
+    class_map = {"fish": 0, "shrimp": 1, "other": 2}
+    
+    for label_name, label_idx in class_map.items():
+        folder = Path("datasets/processed") / label_name
+        if label_name in ["fish", "shrimp"]:
+            manifest = Path("datasets/processed") / f"{label_name}_processed_manifest.csv"
+            if manifest.exists():
+                df = pd.read_csv(manifest)
+                for _, row in df.iterrows():
+                    img_path = folder / row["image_path"]
+                    if img_path.exists():
+                        samples.append((img_path, label_idx))
+        else:
+            for img_path in folder.glob("*.jpg"):
+                samples.append((img_path, label_idx))
 
-    fish_df['species_label'] = 0
-    shrimp_df['species_label'] = 1
-
-    # Combine training folds
-    train_fish = fish_df[fish_df['fold'] != -1]
-    train_shrimp = shrimp_df[shrimp_df['fold'] != -1]
-    combined_df = pd.concat([train_fish, train_shrimp], ignore_index=True)
-
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    transform = A.Compose([
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2()
     ])
 
-    dataset = CombinedSpeciesDataset(combined_df, transform=transform)
-    loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    dataset = SpeciesGateDataset(samples, transform=transform)
+    loader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=0)
 
-    # Lightweight backbone: ResNet18
+    # ResNet18 configured for 3 classes
     model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-    model.fc = nn.Linear(model.fc.in_features, 2)
+    model.fc = nn.Linear(model.fc.in_features, 3)
     model = model.to(device)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
     model.train()
-    for epoch in range(3): # 3 epochs is plenty for a simple 2-class problem
-        total_loss = 0.0
-        correct = 0
-        total = 0
-        for images, labels in loader:
-            images, labels = images.to(device), labels.to(device)
+    for epoch in range(4):
+        total_loss, correct, total = 0.0, 0, 0
+        for imgs, labels in loader:
+            imgs, labels = imgs.to(device), labels.to(device)
             optimizer.zero_grad()
-            outputs = model(images)
+            outputs = model(imgs)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item() * images.size(0)
-            _, preds = torch.max(outputs, 1)
+            total_loss += loss.item() * len(labels)
+            preds = outputs.argmax(dim=1)
             correct += (preds == labels).sum().item()
-            total += labels.size(0)
+            total += len(labels)
 
-        acc = correct / total
-        print(f"Gate Epoch {epoch+1}/3 - Loss: {total_loss/total:.4f} - Accuracy: {acc*100:.2f}%")
+        print(f"Gate Epoch {epoch+1}/4 - Loss: {total_loss/total:.4f} - Accuracy: {correct/total*100:.2f}%")
 
-    Path("checkpoints").mkdir(exist_ok=True)
-    out_path = Path("checkpoints/species_gate_best.pt")
-    torch.save(model.state_dict(), out_path)
-    print(f"Species Gate saved to {out_path}")
+    os.makedirs("checkpoints", exist_ok=True)
+    torch.save(model.state_dict(), "checkpoints/species_gate_best.pt")
+    print("Saved 3-Class Gate to checkpoints/species_gate_best.pt")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     train_gate()

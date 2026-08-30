@@ -33,7 +33,14 @@ def deduplicate_split_group(df_split: pd.DataFrame, max_hamming_dist: int = 4) -
 
     df = df_split.copy().reset_index(drop=True)
     df["dhash"] = df["image_path"].apply(compute_dhash)
-    
+
+    # Deprioritize Augmented_shrimp: when a duplicate/near-duplicate pair is
+    # found, the loop below keeps whichever row it sees first. Sorting these
+    # paths to the end ensures the higher-quality original (e.g. ShrimpImages)
+    # is kept and the lower-resolution Augmented_shrimp copy is dropped.
+    df["_low_priority"] = df["image_path"].str.contains("Augmented_shrimp", regex=False)
+    df = df.sort_values("_low_priority", kind="stable").reset_index(drop=True)
+
     valid_df = df.dropna(subset=["dhash"]).copy()
     hashes = valid_df["dhash"].tolist()
     indices = valid_df.index.tolist()
@@ -53,7 +60,7 @@ def deduplicate_split_group(df_split: pd.DataFrame, max_hamming_dist: int = 4) -
                 suppressed.add(indices[j])
                 dropped_count += 1
 
-    clean_df = valid_df.loc[keep_indices].drop(columns=["dhash"])
+    clean_df = valid_df.loc[keep_indices].drop(columns=["dhash", "_low_priority"])
     return clean_df, dropped_count
 
 def run(config):

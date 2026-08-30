@@ -35,7 +35,15 @@ class AquaDataset(Dataset):
         self.img_size = img_size
         self.species = species
         self.tab_cols = tab_cols or []
-        self.transforms = get_transforms(is_train=is_train)
+        self.is_train = is_train
+        # Two transform sets: full random augmentation for organic training
+        # images, and a light (resize/normalize-only) transform for eval AND
+        # for rows already flagged is_augmented -- those images already have
+        # baked-in rotation/color transforms from a prior augmentation pass,
+        # so re-applying the full random pipeline on top would compound
+        # distortion instead of adding useful variety.
+        self.train_transform = get_transforms(is_train=True)
+        self.light_transform = get_transforms(is_train=False)
 
     def __len__(self):
         return len(self.df)
@@ -52,7 +60,10 @@ class AquaDataset(Dataset):
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         img_resized = letterbox_resize(img, target_size=self.img_size, species=self.species)
-        augmented = self.transforms(image=img_resized)
+
+        is_pre_augmented = bool(row.get("is_augmented", False))
+        transform = self.train_transform if (self.is_train and not is_pre_augmented) else self.light_transform
+        augmented = transform(image=img_resized)
         img_tensor = augmented["image"]
 
         label = int(row["label_idx"]) if "label_idx" in row else 0

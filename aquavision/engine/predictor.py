@@ -32,16 +32,16 @@ class AquaPredictor:
         self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device, weights_only=True))
         self.model.eval()
 
-        # --- SPECIES GATE SETUP ---
+        # --- 3-CLASS SPECIES & OOD GATE SETUP ---
         gate_path = Path("checkpoints/species_gate_best.pt")
-        self.gate_classes = {0: "fish", 1: "shrimp"}
+        self.gate_classes = {0: "fish", 1: "shrimp", 2: "other"}
         self.species_gate = models.resnet18(weights=None)
-        self.species_gate.fc = nn.Linear(self.species_gate.fc.in_features, 2)
+        self.species_gate.fc = nn.Linear(self.species_gate.fc.in_features, 3)
         if gate_path.exists():
             self.species_gate.load_state_dict(torch.load(gate_path, map_location=self.device, weights_only=True))
         self.species_gate = self.species_gate.to(self.device)
         self.species_gate.eval()
-        # --------------------------
+        # ----------------------------------------
 
         self.transform = A.Compose([
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
@@ -58,7 +58,7 @@ class AquaPredictor:
         img_resized = letterbox_resize(img, target_size=224, species=self.species)
         img_tensor = self.transform(image=img_resized)["image"].unsqueeze(0).to(self.device)
 
-        # --- 1. RUN SPECIES GATE ---
+        # --- 1. RUN SPECIES & OOD GATE ---
         with torch.no_grad():
             gate_logits = self.species_gate(img_tensor)
             gate_probs = F.softmax(gate_logits, dim=1).squeeze(0).cpu().numpy()
@@ -66,17 +66,27 @@ class AquaPredictor:
             detected_species = self.gate_classes[gate_pred_idx]
             detected_conf = float(gate_probs[gate_pred_idx])
 
-        # --- 2. VALIDATE SPECIES ---
-        if detected_species != self.species.lower() and detected_conf > 0.65:
+        # --- 2. INTERCEPT NON-AQUATIC OBJECTS (Chairs, tables, random objects) ---
+        if detected_species == "other" or detected_conf < 0.45:
+            return {
+                "prediction": "Invalid Subject",
+                "confidence": detected_conf,
+                "all_probabilities": {},
+                "is_mismatch": True,
+                "message": f"Non-Aquatic Image Detected ({detected_conf*100:.1f}% confidence). Please upload a clear photo of a fish or shrimp."
+            }
+
+        # --- 3. INTERCEPT SPECIES MISMATCH (Fish uploaded while Shrimp selected, etc.) ---
+        if detected_species != self.species.lower() and detected_conf > 0.55:
             return {
                 "prediction": "Species Mismatch",
                 "confidence": detected_conf,
                 "all_probabilities": {},
                 "is_mismatch": True,
-                "message": f"Warning: You selected '{self.species}', but the model is {detected_conf*100:.1f}% confident this image is a {detected_species}."
+                "message": f"Warning: You selected '{self.species}', but the gate detected a {detected_species} ({detected_conf*100:.1f}% confidence)."
             }
 
-        # --- 3. RUN DISEASE PREDICTION ---
+        # --- 4. RUN DISEASE PREDICTION ---
         with torch.no_grad():
             if self.tab_cols and water_quality_dict:
                 wq = water_quality_dict.copy()
