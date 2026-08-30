@@ -1,4 +1,8 @@
-﻿import pandas as pd
+﻿import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dedupe import deduplicate_split_group
+import pandas as pd
 import numpy as np
 from pathlib import Path
 from sklearn.model_selection import StratifiedKFold
@@ -60,6 +64,12 @@ def build_robust_manifest(species: str = "fish"):
         })
 
     df = pd.DataFrame(records)
+    
+    # --- DEDUPLICATION START ---
+    print(f"[{species.upper()}] Running perceptual deduplication...")
+    df, dropped = deduplicate_split_group(df, max_hamming_dist=4)
+    print(f"[{species.upper()}] Dropped {dropped} duplicate/downscaled images.")
+    # --- DEDUPLICATION END ---
     print(f"[{species.upper()}] Parsed {len(df)} images ({df['is_test'].sum()} held-out test samples)")
 
     # Assign K-Fold to training data, -1 to test set

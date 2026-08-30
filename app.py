@@ -2,9 +2,9 @@
 import cv2
 import numpy as np
 from PIL import Image
-from aquavision.predict import AquaPredictor
+from aquavision.engine.predictor import AquaPredictor
 
-st.title("AquaVision BD — Diagnostic Dashboard")
+st.title("AquaVision BD - Diagnostic Dashboard")
 
 species = st.sidebar.selectbox("Select Species", ["fish", "shrimp"])
 predictor = AquaPredictor(species=species, fold=0)
@@ -26,5 +26,11 @@ if uploaded_file is not None:
         wq_dict = {"temperature": temp, "ph": ph, "dissolved_oxygen": do, "ammonia": ammonia}
         result = predictor.predict(img_array, water_quality_dict=wq_dict)
         
-        st.success(f"**Prediction:** {result['prediction']}")
-        st.info(f"**Confidence:** {result['confidence']*100:.2f}%")
+        # --- NEW: Catch the Species Gate Mismatch ---
+        if result.get("is_mismatch"):
+            st.error(f"🚨 {result['message']}")
+            st.warning("Please select the correct species from the sidebar to continue.")
+        # ---------------------------------------------
+        else:
+            st.success(f"**Prediction:** {result['prediction']}")
+            st.info(f"**Confidence:** {result['confidence']*100:.2f}%")

@@ -1,4 +1,6 @@
 ﻿import torch
+import torch.nn as nn
+from torchvision import models
 import torch.nn.functional as F
 import numpy as np
 import pandas as pd
@@ -30,6 +32,17 @@ class AquaPredictor:
         self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device, weights_only=True))
         self.model.eval()
 
+        # --- SPECIES GATE SETUP ---
+        gate_path = Path("checkpoints/species_gate_best.pt")
+        self.gate_classes = {0: "fish", 1: "shrimp"}
+        self.species_gate = models.resnet18(weights=None)
+        self.species_gate.fc = nn.Linear(self.species_gate.fc.in_features, 2)
+        if gate_path.exists():
+            self.species_gate.load_state_dict(torch.load(gate_path, map_location=self.device, weights_only=True))
+        self.species_gate = self.species_gate.to(self.device)
+        self.species_gate.eval()
+        # --------------------------
+
         self.transform = A.Compose([
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2()
@@ -45,23 +58,47 @@ class AquaPredictor:
         img_resized = letterbox_resize(img, target_size=224, species=self.species)
         img_tensor = self.transform(image=img_resized)["image"].unsqueeze(0).to(self.device)
 
-        if self.tab_cols and water_quality_dict:
-            wq = water_quality_dict.copy()
-            wq["temp_do_ratio"] = wq.get("temperature", 25.0) / (wq.get("dissolved_oxygen", 6.0) + 1e-5)
-            wq["ammonia_toxicity_index"] = wq.get("ammonia", 0.01) * (10 ** (wq.get("ph", 7.5) - 7.0)) * (wq.get("temperature", 25.0) / 25.0)
-            wq["stress_score"] = (abs(wq.get("ph", 7.5) - 7.5) * 0.3) + (wq.get("ammonia", 0.01) * 10.0 * 0.4) + (max(0, 6.0 - wq.get("dissolved_oxygen", 6.0)) * 0.3)
+        # --- 1. RUN SPECIES GATE ---
+        with torch.no_grad():
+            gate_logits = self.species_gate(img_tensor)
+            gate_probs = F.softmax(gate_logits, dim=1).squeeze(0).cpu().numpy()
+            gate_pred_idx = int(np.argmax(gate_probs))
+            detected_species = self.gate_classes[gate_pred_idx]
+            detected_conf = float(gate_probs[gate_pred_idx])
 
-            raw_df = pd.DataFrame([[wq[c] for c in self.tab_cols]], columns=self.tab_cols)
-            scaled_vector = self.scaler.transform(raw_df)[0] if self.scaler else raw_df.values[0]
-            tab_tensor = torch.tensor(scaled_vector, dtype=torch.float32).unsqueeze(0).to(self.device)
-            logits = self.model(img_tensor, tab_tensor)
-        else:
-            logits = self.model(img_tensor)
+        # --- 2. VALIDATE SPECIES ---
+        if detected_species != self.species.lower() and detected_conf > 0.65:
+            return {
+                "prediction": "Species Mismatch",
+                "confidence": detected_conf,
+                "all_probabilities": {},
+                "is_mismatch": True,
+                "message": f"Warning: You selected '{self.species}', but the model is {detected_conf*100:.1f}% confident this image is a {detected_species}."
+            }
 
-        probs = F.softmax(logits, dim=1).squeeze().cpu().detach().numpy()
+        # --- 3. RUN DISEASE PREDICTION ---
+        with torch.no_grad():
+            if self.tab_cols and water_quality_dict:
+                wq = water_quality_dict.copy()
+                wq["temp_do_ratio"] = wq.get("temperature", 25.0) / (wq.get("dissolved_oxygen", 6.0) + 1e-5)
+                wq["ammonia_toxicity_index"] = wq.get("ammonia", 0.01) * (10 ** (wq.get("ph", 7.5) - 7.0)) * (wq.get("temperature", 25.0) / 25.0)
+                wq["stress_score"] = (abs(wq.get("ph", 7.5) - 7.5) * 0.3) + (wq.get("ammonia", 0.01) * 10.0 * 0.4) + (max(0, 6.0 - wq.get("dissolved_oxygen", 6.0)) * 0.3)
+
+                raw_df = pd.DataFrame([[wq[c] for c in self.tab_cols]], columns=self.tab_cols)
+                scaled_vector = self.scaler.transform(raw_df)[0] if self.scaler else raw_df.values[0]
+                tab_tensor = torch.tensor(scaled_vector, dtype=torch.float32).unsqueeze(0).to(self.device)
+                logits = self.model(img_tensor, tab_tensor)
+            else:
+                logits = self.model(img_tensor)
+
+        probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+        if probs.ndim == 0:
+            probs = np.array([probs])
+            
         top_idx = int(np.argmax(probs))
         return {
             "prediction": self.classes[top_idx],
             "confidence": float(probs[top_idx]),
-            "all_probabilities": {cls: float(p) for cls, p in zip(self.classes, probs)}
+            "all_probabilities": {cls: float(p) for cls, p in zip(self.classes, probs)},
+            "is_mismatch": False
         }

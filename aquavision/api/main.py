@@ -74,7 +74,7 @@ def serve_rich_testing_ui():
         <meta charset="UTF-8">
         <title>AquaVision Multimodal Engine</title>
         <style>
-            :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --accent: #38bdf8; --border: #334155; --success: #10b981; }
+            :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --accent: #38bdf8; --border: #334155; --success: #10b981; --error: #ef4444; }
             body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 2rem; margin: 0; }
             .container { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
             .card { background: var(--card); border: 1px solid var(--border); border-radius: 1rem; padding: 2rem; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.5); }
@@ -90,6 +90,11 @@ def serve_rich_testing_ui():
             .main-result { background: rgba(56, 189, 248, 0.1); border: 1px solid var(--accent); padding: 1.5rem; border-radius: 0.5rem; text-align: center; margin-bottom: 2rem; display: none; }
             .main-result h2 { margin: 0; font-size: 2rem; color: var(--text); }
             .main-result span { color: var(--accent); font-weight: bold; font-size: 1.25rem; }
+            
+            /* Warning Box Styling */
+            .mismatch-alert { background: rgba(239, 68, 68, 0.15); border: 1px solid var(--error); padding: 1.5rem; border-radius: 0.5rem; color: #fca5a5; margin-bottom: 1rem; display: none; }
+            .mismatch-alert h3 { margin: 0 0 0.5rem 0; color: var(--error); }
+            
             .prob-item { margin-bottom: 1rem; }
             .prob-header { display: flex; justify-content: space-between; font-size: 0.875rem; margin-bottom: 0.25rem; }
             .prob-track { background: var(--bg); height: 8px; border-radius: 4px; overflow: hidden; }
@@ -133,6 +138,12 @@ def serve_rich_testing_ui():
                 <h2>2. Diagnostic Report</h2>
                 <p id="placeholder" style="color: #94a3b8;">Awaiting data input...</p>
                 
+                <!-- Species Mismatch Alert Banner -->
+                <div class="mismatch-alert" id="mismatchAlertBox">
+                    <h3>🚨 Species Mismatch Detected</h3>
+                    <p id="mismatchMessage" style="margin: 0;"></p>
+                </div>
+
                 <div class="main-result" id="mainResultBox">
                     <h2 id="topPrediction">--</h2>
                     <span id="topConfidence">--% Confidence</span>
@@ -157,9 +168,16 @@ def serve_rich_testing_ui():
                 e.preventDefault();
                 const btn = document.getElementById('submitBtn');
                 const errBox = document.getElementById('error-box');
+                const mainResultBox = document.getElementById('mainResultBox');
+                const mismatchBox = document.getElementById('mismatchAlertBox');
+                const breakdown = document.getElementById('probBreakdown');
+
                 btn.textContent = 'Running Inference...';
                 btn.disabled = true;
                 errBox.style.display = 'none';
+                mainResultBox.style.display = 'none';
+                mismatchBox.style.display = 'none';
+                breakdown.innerHTML = '';
 
                 const formData = new FormData();
                 formData.append('file', document.getElementById('file').files[0]);
@@ -179,26 +197,30 @@ def serve_rich_testing_ui():
                     
                     if (res.ok) {
                         document.getElementById('placeholder').style.display = 'none';
-                        document.getElementById('mainResultBox').style.display = 'block';
                         
-                        document.getElementById('topPrediction').textContent = data.prediction;
-                        document.getElementById('topConfidence').textContent = (data.confidence * 100).toFixed(1) + '% Confidence';
+                        if (data.is_mismatch) {
+                            // Show Red Alert Box for Species Mismatch
+                            document.getElementById('mismatchMessage').textContent = data.message;
+                            mismatchBox.style.display = 'block';
+                        } else {
+                            // Show Normal Diagnosis Results
+                            mainResultBox.style.display = 'block';
+                            document.getElementById('topPrediction').textContent = data.prediction;
+                            document.getElementById('topConfidence').textContent = (data.confidence * 100).toFixed(1) + '% Confidence';
 
-                        const breakdown = document.getElementById('probBreakdown');
-                        breakdown.innerHTML = '<h3 style="margin-bottom: 1rem;">Probability Breakdown</h3>';
-                        
-                        // Sort probabilities descending
-                        const sortedProbs = Object.entries(data.all_probabilities).sort((a, b) => b[1] - a[1]);
-                        
-                        sortedProbs.forEach(([cls, prob]) => {
-                            const pct = (prob * 100).toFixed(1);
-                            breakdown.innerHTML += `
-                                <div class="prob-item">
-                                    <div class="prob-header"><span>${cls}</span><span>${pct}%</span></div>
-                                    <div class="prob-track"><div class="prob-fill" style="width: ${pct}%"></div></div>
-                                </div>
-                            `;
-                        });
+                            breakdown.innerHTML = '<h3 style="margin-bottom: 1rem;">Probability Breakdown</h3>';
+                            const sortedProbs = Object.entries(data.all_probabilities).sort((a, b) => b[1] - a[1]);
+                            
+                            sortedProbs.forEach(([cls, prob]) => {
+                                const pct = (prob * 100).toFixed(1);
+                                breakdown.innerHTML += `
+                                    <div class="prob-item">
+                                        <div class="prob-header"><span>${cls}</span><span>${pct}%</span></div>
+                                        <div class="prob-track"><div class="prob-fill" style="width: ${pct}%"></div></div>
+                                    </div>
+                                `;
+                            });
+                        }
                     } else {
                         errBox.textContent = data.detail || 'Prediction failed.';
                         errBox.style.display = 'block';

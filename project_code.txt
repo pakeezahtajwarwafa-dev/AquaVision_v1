@@ -1,0 +1,3349 @@
+﻿
+
+=== app.py ===
+import streamlit as st
+import cv2
+import numpy as np
+from PIL import Image
+from aquavision.predict import AquaPredictor
+
+st.title("AquaVision BD — Diagnostic Dashboard")
+
+species = st.sidebar.selectbox("Select Species", ["fish", "shrimp"])
+predictor = AquaPredictor(species=species, fold=0)
+
+uploaded_file = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
+
+st.sidebar.subheader("Water Quality Parameters")
+temp = st.sidebar.slider("Temperature (°C)", 15.0, 35.0, 25.0)
+ph = st.sidebar.slider("pH Level", 5.0, 10.0, 7.5)
+do = st.sidebar.slider("Dissolved Oxygen (mg/L)", 1.0, 10.0, 6.0)
+ammonia = st.sidebar.slider("Ammonia (mg/L)", 0.0, 3.0, 0.01)
+
+if uploaded_file is not None:
+    image = Image.open(uploaded_file)
+    img_array = np.array(image.convert("RGB"))
+    st.image(image, caption="Uploaded Image", use_container_width=True)
+
+    if st.button("Run Diagnosis"):
+        wq_dict = {"temperature": temp, "ph": ph, "dissolved_oxygen": do, "ammonia": ammonia}
+        result = predictor.predict(img_array, water_quality_dict=wq_dict)
+        
+        st.success(f"**Prediction:** {result['prediction']}")
+        st.info(f"**Confidence:** {result['confidence']*100:.2f}%")
+
+
+
+=== config.py ===
+import yaml
+from pathlib import Path
+from types import SimpleNamespace
+
+def _dict_to_sns(d):
+    if isinstance(d, dict):
+        return SimpleNamespace(**{k: _dict_to_sns(v) for k, v in d.items()})
+    elif isinstance(d, list):
+        return [_dict_to_sns(i) for i in d]
+    return d
+
+def load_config(path="config.yaml"):
+    config_path = Path(path).resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"Configuration file not found at: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    raw["paths"] = {k: Path(v).resolve() for k, v in raw["paths"].items()}
+    return _dict_to_sns(raw)
+
+if __name__ == "__main__":
+    cfg = load_config()
+    print("Config successfully loaded!")
+
+
+
+=== eval.py ===
+import torch
+import pandas as pd
+from PIL import Image
+from pathlib import Path
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from sklearn.metrics import classification_report, confusion_matrix
+import numpy as np
+
+from aquavision.models.vision_backbone import AquaVisionModel
+
+class AquaDataset(Dataset):
+    def __init__(self, df, transform=None, class_to_idx=None):
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+        self.class_to_idx = class_to_idx
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        img_path = self.df.loc[idx, 'image_path']
+        label_str = self.df.loc[idx, 'label']
+        
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+            
+        label = self.class_to_idx[label_str]
+        return image, label
+
+def evaluate_model(species="fish", backbone="efficientnet_b0", best_fold=3):
+    csv_path = Path(f"datasets/processed/{species}_processed_manifest.csv")
+    df = pd.read_csv(csv_path)
+    
+    # 1. Rebuild Class Mappings from Training Data
+    train_df = df[df['fold'] >= 0]
+    classes = sorted(train_df['label'].unique())
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+    idx_to_class = {i: c for c, i in class_to_idx.items()}
+    num_classes = len(classes)
+    
+    # 2. Isolate the Zero-Leakage Test Set
+    test_df = df[df['fold'] == -1].copy()
+    print(f"\n--- Zero-Leakage Evaluation: {species.upper()} ---")
+    print(f"Evaluating Fold {best_fold} on {len(test_df)} held-out samples...")
+
+    if len(test_df) == 0:
+        print("[ERROR] No held-out test samples found (fold == -1).")
+        return
+
+    test_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    test_ds = AquaDataset(test_df, transform=test_transform, class_to_idx=class_to_idx)
+    test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=2)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 3. Load the Best Model Weights
+    model = AquaVisionModel(num_classes=num_classes, backbone=backbone).to(device)
+    ckpt_path = Path(f"checkpoints/{backbone}_{species}_fold{best_fold}_best.pt")
+    
+    if not ckpt_path.exists():
+        print(f"[ERROR] Could not find checkpoint: {ckpt_path}")
+        return
+        
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.eval()
+
+    all_preds = []
+    all_labels = []
+
+    # 4. Run Inference
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs, 1)
+            
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.numpy())
+
+    # 5. Generate Reports
+    print("\n[ Classification Report ]")
+    print(classification_report(all_labels, all_preds, target_names=classes, zero_division=0))
+
+    print("\n[ Confusion Matrix ]")
+    cm = confusion_matrix(all_labels, all_preds)
+
+    # Print a nicely formatted text-based confusion matrix
+    header = f"{'True / Pred':<35} " + " ".join([f"{i:>5}" for i in range(num_classes)])
+    print(header)
+    print("-" * len(header))
+    for i, class_name in enumerate(classes):
+        row_str = f"{i}. {class_name[:30]:<31} | " + " ".join([f"{cm[i][j]:>5}" for j in range(num_classes)])
+        print(row_str)
+
+if __name__ == "__main__":
+    # Pointing explicitly to fold 3 based on your training logs
+    evaluate_model(species="fish", backbone="efficientnet_b0", best_fold=3)
+
+
+
+=== export_onnx.py ===
+import torch
+from pathlib import Path
+from aquavision.models.vision_backbone import AquaVisionModel
+import pandas as pd
+
+def export_to_onnx(species="fish", backbone="efficientnet_b0", best_fold=3):
+    # 1. Setup paths
+    ckpt_path = Path(f"checkpoints/{backbone}_{species}_fold{best_fold}_best.pt")
+    exports_dir = Path("exports")
+    exports_dir.mkdir(exist_ok=True)
+    onnx_path = exports_dir / f"{backbone}_{species}_optimized.onnx"
+
+    if not ckpt_path.exists():
+        print(f"[ERROR] Checkpoint not found at {ckpt_path}")
+        return
+
+    # 2. Get number of classes from the manifest
+    csv_path = Path(f"datasets/processed/{species}_processed_manifest.csv")
+    df = pd.read_csv(csv_path)
+    num_classes = df[df['fold'] >= 0]['label'].nunique()
+
+    print(f"\n--- Starting ONNX Export for {species.upper()} ---")
+    
+    # 3. Load PyTorch model
+    device = torch.device("cpu") # Always export on CPU for maximum compatibility
+    model = AquaVisionModel(num_classes=num_classes, backbone=backbone).to(device)
+    
+    # Using weights_only=True to silence the security warning
+    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
+    model.eval()
+
+    # 4. Create a dummy input tensor matching the image dimensions (Batch, Channels, Height, Width)
+    dummy_input = torch.randn(1, 3, 224, 224).to(device)
+
+    # 5. Export to ONNX
+    print("Compiling PyTorch graph to ONNX...")
+    torch.onnx.export(
+        model,
+        dummy_input,
+        onnx_path,
+        export_params=True,
+        opset_version=14,          # Opset 14 is highly stable for EfficientNet/ResNet
+        do_constant_folding=True,  # Optimizes constant operations
+        input_names=['input'],
+        output_names=['output'],
+        dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}} # Allows variable batch sizes later
+    )
+    
+    print(f"[SUCCESS] Model optimized and saved to: {onnx_path}")
+
+if __name__ == "__main__":
+    export_to_onnx()
+
+
+
+=== predict.py ===
+import onnxruntime as ort
+import numpy as np
+from PIL import Image
+import pandas as pd
+from pathlib import Path
+import sys
+
+def preprocess_image(image_path):
+    img = Image.open(image_path).convert('RGB')
+    img = img.resize((224, 224))
+    
+    img_data = np.array(img, dtype=np.float32) / 255.0
+
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    img_data = (img_data - mean) / std
+
+    img_data = np.transpose(img_data, (2, 0, 1))
+    img_data = np.expand_dims(img_data, axis=0).astype(np.float32)
+    return img_data
+
+def predict(image_path, species="fish", backbone="efficientnet_b0"):
+    onnx_path = Path(f"exports/{backbone}_{species}_optimized.onnx")
+    csv_path = Path(f"datasets/processed/{species}_processed_manifest.csv")
+
+    if not onnx_path.exists():
+        print(f"[ERROR] ONNX model not found: {onnx_path}")
+        return
+
+    df = pd.read_csv(csv_path)
+    classes = sorted(df[df['fold'] >= 0]['label'].unique())
+
+    session = ort.InferenceSession(str(onnx_path))
+    input_name = session.get_inputs()[0].name
+    
+    img_tensor = preprocess_image(image_path)
+    
+    logits = session.run(None, {input_name: img_tensor})[0][0]
+    
+    exp_preds = np.exp(logits - np.max(logits))
+    probs = exp_preds / exp_preds.sum()
+    
+    top_idx = np.argmax(probs)
+    top_class = classes[top_idx]
+    top_conf = probs[top_idx] * 100
+
+    print("\n" + "="*40)
+    print("🔬 AQUAVISION INFERENCE ENGINE 🔬")
+    print("="*40)
+    print(f"File:       {Path(image_path).name}")
+    print(f"Prediction: {top_class}")
+    print(f"Confidence: {top_conf:.2f}%")
+    print("="*40 + "\n")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python predict.py <path_to_image>")
+    else:
+        predict(sys.argv[1])
+
+
+
+=== train.py ===
+import os
+import torch
+import pandas as pd
+from PIL import Image
+from pathlib import Path
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+
+from aquavision.models.vision_backbone import AquaVisionModel
+
+class AquaDataset(Dataset):
+    def __init__(self, df, transform=None, class_to_idx=None):
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+        self.class_to_idx = class_to_idx
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        img_path = self.df.loc[idx, 'image_path']
+        label_str = self.df.loc[idx, 'label']
+        
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+            
+        label = self.class_to_idx[label_str]
+        return image, label
+
+def train_folds(species="fish", backbone="efficientnet_b0", epochs=5, batch_size=32):
+    csv_path = Path(f"datasets/processed/{species}_processed_manifest.csv")
+    if not csv_path.exists():
+        print(f"[ERROR] Could not find {csv_path}")
+        return
+
+    df = pd.read_csv(csv_path)
+    
+    # Exclude the zero-leakage test set (fold -1)
+    train_df = df[df['fold'] >= 0].copy()
+    
+    # Map string labels to integers
+    classes = sorted(train_df['label'].unique())
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+    num_classes = len(classes)
+    
+    print(f"\\n--- Starting 5-Fold Training for {species.upper()} ---")
+    print(f"Classes ({num_classes}): {classes}")
+    
+    # Ensure checkpoints directory exists
+    Path("checkpoints").mkdir(exist_ok=True)
+
+    # Standard ImageNet transforms
+    train_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    val_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    for fold in range(5):
+        print(f"\\n=== FOLD {fold} ===")
+        
+        train_sub = train_df[train_df['fold'] != fold]
+        val_sub = train_df[train_df['fold'] == fold]
+        
+        train_ds = AquaDataset(train_sub, transform=train_transform, class_to_idx=class_to_idx)
+        val_ds = AquaDataset(val_sub, transform=val_transform, class_to_idx=class_to_idx)
+        
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2)
+        
+        model = AquaVisionModel(num_classes=num_classes, backbone=backbone).to(device)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=1e-4)
+        
+        best_val_acc = 0.0
+        
+        for epoch in range(epochs):
+            model.train()
+            running_loss = 0.0
+            
+            for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
+                inputs, labels = inputs.to(device), labels.to(device)
+                
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item() * inputs.size(0)
+                
+            model.eval()
+            val_loss = 0.0
+            correct = 0
+            total = 0
+            
+            with torch.no_grad():
+                for inputs, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                    
+                    val_loss += loss.item() * inputs.size(0)
+                    _, predicted = torch.max(outputs, 1)
+                    total += labels.size(0)
+                    correct += (predicted == labels).sum().item()
+                    
+            val_acc = correct / total
+            print(f"Fold {fold} | Epoch {epoch+1} | Val Acc: {val_acc:.4f}")
+            
+            # Save best model for this fold
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                ckpt_name = f"checkpoints/{backbone}_fish_fold{fold}_best.pt"
+                torch.save(model.state_dict(), ckpt_name)
+                
+        print(f"Best Val Accuracy for Fold {fold}: {best_val_acc:.4f}")
+
+if __name__ == "__main__":
+    # Feel free to change backbone to 'resnet50' and increase epochs
+    train_folds(species="fish", backbone="efficientnet_b0", epochs=5)
+
+
+
+=== audit.py ===
+import cv2
+import pandas as pd
+from pathlib import Path
+from PIL import Image, ImageOps
+
+def verify_and_clean_manifest(manifest_path: Path) -> pd.DataFrame:
+    """Checks image decodability and EXIF orientation across manifest records."""
+    if not manifest_path.exists():
+        return pd.DataFrame()
+
+    df = pd.read_csv(manifest_path)
+    valid_rows = []
+    corrupt_count = 0
+
+    for idx, row in df.iterrows():
+        p = str(row["image_path"])
+        try:
+            # Step 1: Open with PIL to check EXIF rotation and header integrity
+            with Image.open(p) as img:
+                img = ImageOps.exif_transpose(img)
+                img.verify()
+            
+            # Step 2: Decode pixels with OpenCV to ensure compatibility
+            cv_img = cv2.imread(p)
+            if cv_img is None or cv_img.size == 0:
+                corrupt_count += 1
+                continue
+                
+            valid_rows.append(row.to_dict())
+        except Exception:
+            corrupt_count += 1
+
+    clean_df = pd.DataFrame(valid_rows)
+    print(f"[{manifest_path.name}] Verified {len(clean_df)} valid images. (Dropped {corrupt_count} corrupt/unreadable files)")
+    return clean_df
+
+def run():
+    manifest_dir = Path("datasets/manifests")
+    for species in ["fish", "shrimp"]:
+        manifest_file = manifest_dir / f"{species}_manifest_deduped.csv"
+        if manifest_file.exists():
+            df_clean = verify_and_clean_manifest(manifest_file)
+            df_clean.to_csv(manifest_file, index=False)
+
+if __name__ == "__main__":
+    run()
+
+
+
+=== dataset.py ===
+import torch
+from torch.utils.data import Dataset
+import cv2
+import numpy as np
+import pandas as pd
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+from aquavision.preprocessing import letterbox_resize
+
+def get_transforms(is_train: bool = True):
+    """Returns Albumentations transformation pipeline tailored for underwater imaging."""
+    if is_train:
+        return A.Compose([
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.3),
+            A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=30, p=0.7, border_mode=cv2.BORDER_CONSTANT),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.6),
+            A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=25, val_shift_limit=20, p=0.5),
+            A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+            A.GaussianBlur(blur_limit=(3, 7), p=0.3),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+    else:
+        return A.Compose([
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+
+class AquaDataset(Dataset):
+    """PyTorch Dataset loading letterboxed images & optional scaled water metrics."""
+    def __init__(self, df: pd.DataFrame, img_size: int = 224, is_train: bool = True, species: str = "fish", tab_cols: list = None):
+        self.df = df.reset_index(drop=True)
+        self.img_size = img_size
+        self.species = species
+        self.tab_cols = tab_cols or []
+        self.transforms = get_transforms(is_train=is_train)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_path = row["image_path"]
+
+        img = cv2.imread(img_path)
+        if img is None:
+            # Fallback zero array if corrupt image
+            img = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        img_resized = letterbox_resize(img, target_size=self.img_size, species=self.species)
+        augmented = self.transforms(image=img_resized)
+        img_tensor = augmented["image"]
+
+        label = int(row["label_idx"]) if "label_idx" in row else 0
+
+        if self.tab_cols:
+            tab_vector = row[self.tab_cols].values.astype(np.float32)
+            tab_tensor = torch.tensor(tab_vector, dtype=torch.float32)
+            return img_tensor, tab_tensor, torch.tensor(label, dtype=torch.long)
+
+        return img_tensor, torch.tensor(label, dtype=torch.long)
+
+
+
+=== dataset_legacy.py ===
+import cv2
+import torch
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from aquavision.preprocessing import letterbox_resize
+
+class AquaDataset(Dataset):
+    """PyTorch Dataset with auto label-encoding, letterbox padding, and multimodal feature support."""
+    def __init__(
+        self, 
+        df: pd.DataFrame, 
+        img_size: int = 224, 
+        is_train: bool = True, 
+        species: str = "fish",
+        tab_cols: list = None
+    ):
+        self.df = df.reset_index(drop=True).copy()
+        self.img_size = img_size
+        self.is_train = is_train
+        self.species = species
+        self.tab_cols = tab_cols if tab_cols is not None else []
+        
+        # Auto-encode string labels to integer indices if label_idx is absent
+        if "label_idx" not in self.df.columns and "label" in self.df.columns:
+            if self.df["label"].dtype == object or isinstance(self.df["label"].iloc[0], str):
+                unique_labels = sorted(self.df["label"].unique())
+                label2idx = {lbl: idx for idx, lbl in enumerate(unique_labels)}
+                self.df["label_idx"] = self.df["label"].map(label2idx)
+            else:
+                self.df["label_idx"] = self.df["label"]
+
+        # Extract and normalize tabular features if provided
+        if self.tab_cols:
+            self.tab_data = self.df[self.tab_cols].fillna(0.0).values.astype(np.float32)
+        else:
+            self.tab_data = None
+
+        # Base normalization for validation/test & pre-augmented images
+        self.base_transform = A.Compose([
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+        
+        # Augmentation pipeline for un-augmented training images
+        self.geo_transform = A.Compose([
+            A.HorizontalFlip(p=0.5),
+            A.RandomRotate90(p=0.5),
+            A.ColorJitter(brightness=0.2, contrast=0.2, p=0.3),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_path = str(row["image_path"])
+        
+        img = cv2.imread(img_path)
+        if img is None:
+            raise FileNotFoundError(f"Image read error: {img_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Apply species-aware letterbox padding + square resize
+        img = letterbox_resize(img, target_size=self.img_size, species=self.species)
+        
+        # Skip geometric transforms on pre-augmented photos
+        is_aug = row.get("is_augmented", False)
+        if self.is_train and not is_aug:
+            transformed = self.geo_transform(image=img)
+        else:
+            transformed = self.base_transform(image=img)
+            
+        image_tensor = transformed["image"]
+        label = int(row.get("label_idx", 0))
+        
+        if self.tab_data is not None:
+            tab_tensor = torch.tensor(self.tab_data[idx], dtype=torch.float32)
+            return image_tensor, tab_tensor, torch.tensor(label, dtype=torch.long)
+        
+        return image_tensor, torch.tensor(label, dtype=torch.long)
+
+
+
+=== data_prep.py ===
+import cv2
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from sklearn.model_selection import StratifiedKFold
+
+def engineer_aquatic_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "temperature" in df.columns and "dissolved_oxygen" in df.columns:
+        df["temp_do_ratio"] = df["temperature"] / (df["dissolved_oxygen"] + 1e-5)
+    if "ammonia" in df.columns and "ph" in df.columns and "temperature" in df.columns:
+        df["ammonia_toxicity_index"] = df["ammonia"] * (10 ** (df["ph"] - 7.0)) * (df["temperature"] / 25.0)
+    if "ph" in df.columns and "ammonia" in df.columns and "dissolved_oxygen" in df.columns:
+        df["stress_score"] = (
+            np.abs(df["ph"] - 7.5) * 0.3 +
+            (df["ammonia"] * 10.0) * 0.4 +
+            np.maximum(0, 6.0 - df["dissolved_oxygen"]) * 0.3
+        )
+    return df
+
+def generate_kfold_splits(df: pd.DataFrame, n_splits: int = 5) -> pd.DataFrame:
+    df = df.copy()
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    df["fold"] = -1
+    for fold_idx, (_, val_idx) in enumerate(skf.split(df, df["label"])):
+        df.loc[val_idx, "fold"] = fold_idx
+    return df
+
+def sanitize_and_prepare():
+    manifest_dir = Path("datasets/manifests")
+    processed_dir = Path("datasets/processed")
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    for species in ["fish", "shrimp"]:
+        manifest_file = manifest_dir / f"{species}_manifest_deduped.csv"
+        if not manifest_file.exists():
+            continue
+
+        df = pd.read_csv(manifest_file)
+        
+        # Strip rows where 'test_split' was ingested as a target class label
+        df = df[df["label"] != "test_split"].reset_index(drop=True)
+
+        df_final = generate_kfold_splits(df, n_splits=5)
+
+        wq_file = Path("datasets/water_quality") / f"{species}_water_quality.csv"
+        if wq_file.exists():
+            df_wq = pd.read_csv(wq_file)
+            df_final = pd.merge(df_final, df_wq, on=["image_path", "label"], how="left")
+            df_final = engineer_aquatic_features(df_final)
+
+        out_path = processed_dir / f"{species}_processed_manifest.csv"
+        df_final.to_csv(out_path, index=False)
+        print(f"[{species.upper()}] Sanitized manifest saved: {out_path} ({len(df_final)} samples, {df_final['label'].nunique()} classes)")
+
+if __name__ == "__main__":
+    sanitize_and_prepare()
+
+
+
+=== dedupe.py ===
+import pandas as pd
+from pathlib import Path
+from PIL import Image
+from config import load_config
+
+def compute_dhash(image_path: str, hash_size: int = 8) -> int:
+    """Calculates a 64-bit difference hash using PIL to detect near-duplicate images."""
+    try:
+        with Image.open(image_path) as img:
+            img = img.convert("L").resize((hash_size + 1, hash_size), Image.Resampling.BILINEAR)
+            pixels = list(img.getdata())
+            difference = []
+            for row in range(hash_size):
+                for col in range(hash_size):
+                    pixel_left = pixels[row * (hash_size + 1) + col]
+                    pixel_right = pixels[row * (hash_size + 1) + col + 1]
+                    difference.append(pixel_left > pixel_right)
+            decimal_val = 0
+            for bit in difference:
+                decimal_val = (decimal_val << 1) | bit
+            return decimal_val
+    except Exception:
+        return None
+
+def hamming_distance(h1: int, h2: int) -> int:
+    """Calculates Hamming distance between two integer hashes."""
+    return bin(h1 ^ h2).count("1")
+
+def deduplicate_split_group(df_split: pd.DataFrame, max_hamming_dist: int = 4) -> tuple[pd.DataFrame, int]:
+    """Deduplicates rows within a single split dataframe."""
+    if df_split.empty:
+        return df_split, 0
+
+    df = df_split.copy().reset_index(drop=True)
+    df["dhash"] = df["image_path"].apply(compute_dhash)
+    
+    valid_df = df.dropna(subset=["dhash"]).copy()
+    hashes = valid_df["dhash"].tolist()
+    indices = valid_df.index.tolist()
+
+    keep_indices = []
+    suppressed = set()
+    dropped_count = 0
+
+    for i in range(len(hashes)):
+        if indices[i] in suppressed:
+            continue
+        keep_indices.append(indices[i])
+        for j in range(i + 1, len(hashes)):
+            if indices[j] in suppressed:
+                continue
+            if hamming_distance(hashes[i], hashes[j]) <= max_hamming_dist:
+                suppressed.add(indices[j])
+                dropped_count += 1
+
+    clean_df = valid_df.loc[keep_indices].drop(columns=["dhash"])
+    return clean_df, dropped_count
+
+def run(config):
+    manifest_dir = Path("datasets/manifests")
+    if hasattr(config.paths, "datasets"):
+        manifest_dir = config.paths.datasets / "manifests"
+
+    for species in ["fish", "shrimp"]:
+        manifest_file = manifest_dir / f"{species}_manifest.csv"
+        if not manifest_file.exists():
+            continue
+
+        df = pd.read_csv(manifest_file)
+        initial_count = len(df)
+
+        deduped_splits = []
+        total_dropped = 0
+
+        # Perform split-isolated deduplication
+        for split_name, group in df.groupby("split"):
+            clean_split, dropped = deduplicate_split_group(group)
+            deduped_splits.append(clean_split)
+            total_dropped += dropped
+
+        df_deduped = pd.concat(deduped_splits, ignore_index=True)
+        out_file = manifest_dir / f"{species}_manifest_deduped.csv"
+        df_deduped.to_csv(out_file, index=False)
+        print(f"[{species.capitalize()}] Initial: {initial_count} | Removed: {total_dropped} duplicates | Kept: {len(df_deduped)}")
+        print(f"Saved split-aware deduped manifest: {out_file}\n")
+
+if __name__ == "__main__":
+    cfg = load_config()
+    run(cfg)
+
+
+
+=== eda.py ===
+import pandas as pd
+from pathlib import Path
+from config import load_config
+
+def generate_eda_report(species: str, manifest_dir: Path, output_dir: Path):
+    raw_manifest = manifest_dir / f"{species}_manifest.csv"
+    dedup_manifest = manifest_dir / f"{species}_manifest_deduped.csv"
+
+    if not dedup_manifest.exists():
+        print(f"Manifest missing: {dedup_manifest}")
+        return
+
+    df_clean = pd.read_csv(dedup_manifest)
+    
+    # 1. Compute cleaned dataset summary
+    summary = df_clean.groupby('label').agg(
+        clean_count=('image_path', 'count'),
+        augmented_count=('is_augmented', lambda x: x.sum() if 'is_augmented' in df_clean.columns else 0)
+    ).reset_index()
+
+    summary['aug_percent'] = (summary['augmented_count'] / summary['clean_count'] * 100).round(1)
+
+    # 2. Merge with raw baseline count if original manifest exists
+    if raw_manifest.exists():
+        df_raw = pd.read_csv(raw_manifest)
+        raw_counts = df_raw.groupby('label')['image_path'].count().reset_index()
+        raw_counts.columns = ['label', 'original_count']
+        summary = pd.merge(raw_counts, summary, on='label', how='right')
+        summary['removed_duplicates'] = summary['original_count'] - summary['clean_count']
+
+    # 3. Save as a separate NEW report file (does not overwrite baseline)
+    output_file = output_dir / f"{species}_eda_report_cleaned.csv"
+    summary.to_csv(output_file, index=False)
+
+    # 4. Print comparative summary
+    print(f"=== {species.upper()} DATASET EDA COMPARISON ===")
+    print(f"Saved New Report: {output_file}\n")
+    print(summary.to_string(index=False))
+    print("\nSplit Distribution (Cleaned):")
+    print(df_clean['split'].value_counts().to_string())
+    print("\n" + "="*50 + "\n")
+
+def run(config):
+    manifest_dir = Path("datasets/manifests")
+    output_dir = Path("datasets")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for species in ["fish", "shrimp"]:
+        generate_eda_report(species, manifest_dir, output_dir)
+
+if __name__ == "__main__":
+    cfg = load_config()
+    run(cfg)
+
+
+
+=== evaluate.py ===
+import torch
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from torch.utils.data import DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
+
+from aquavision.dataset import AquaDataset
+from aquavision.fusion import AquaVisionMultimodalModel
+
+def get_confusion_matrix_df(y_true, y_pred, labels):
+    cm = confusion_matrix(y_true, y_pred)
+    return pd.DataFrame(cm, index=labels, columns=labels)
+
+def evaluate_test_set(species: str = "fish", fold_to_eval: int = 0):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"=== HELD-OUT EVALUATION: {species.upper()} (Fold {fold_to_eval}) ===")
+
+    processed_manifest = Path("datasets/processed") / f"{species}_processed_manifest.csv"
+    if not processed_manifest.exists():
+        return
+
+    df = pd.read_csv(processed_manifest)
+    
+    # Filter for validation fold
+    test_df = df[df["fold"] == fold_to_eval].copy()
+
+    unique_labels = sorted(df["label"].unique())
+    label2idx = {lbl: idx for idx, lbl in enumerate(unique_labels)}
+    test_df["label_idx"] = test_df["label"].map(label2idx)
+
+    tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in df.columns]
+
+    if tab_cols:
+        scaler = StandardScaler()
+        train_df = df[df["fold"] != fold_to_eval]
+        scaler.fit(train_df[tab_cols].fillna(0.0))
+        test_df[tab_cols] = scaler.transform(test_df[tab_cols].fillna(0.0))
+
+    test_ds = AquaDataset(test_df, img_size=224, is_train=False, species=species, tab_cols=tab_cols)
+    test_loader = DataLoader(test_ds, batch_size=16, shuffle=False)
+
+    checkpoint_path = Path("checkpoints") / f"{species}_best_model_fold{fold_to_eval}.pt"
+    if not checkpoint_path.exists():
+        print(f"  > Checkpoint not found: {checkpoint_path}")
+        return
+
+    model = AquaVisionMultimodalModel(
+        num_classes=len(unique_labels),
+        num_tabular_features=len(tab_cols),
+        backbone_name="resnet18"
+    ).to(device)
+
+    # Safe weights loading with weights_only=True
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
+    model.eval()
+
+    all_preds, all_labels = [], []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            if len(batch) == 3:
+                images, tabular, labels = batch
+                images, tabular = images.to(device), tabular.to(device)
+                outputs = model(images, tabular)
+            else:
+                images, labels = batch
+                images = images.to(device)
+                outputs = model(images)
+
+            preds = torch.argmax(outputs, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.numpy())
+
+    print("\nClassification Report:")
+    report = classification_report(all_labels, all_preds, target_names=unique_labels, digits=4)
+    print(report)
+
+    cm_df = get_confusion_matrix_df(all_labels, all_preds, unique_labels)
+    cm_out = Path("datasets") / f"{species}_confusion_matrix.csv"
+    cm_df.to_csv(cm_out)
+    print(f"Saved confusion matrix to: {cm_out}\n" + "="*50 + "\n")
+
+def run():
+    for species in ["fish", "shrimp"]:
+        evaluate_test_set(species)
+
+if __name__ == "__main__":
+    run()
+
+
+
+=== evaluate_legacy.py ===
+from pathlib import Path
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import classification_report, confusion_matrix
+
+from aquavision.dataset import AquaDataset, get_transforms
+from aquavision.models import build_model
+
+
+class GradCAM:
+    """Grad-CAM visual explainer for PyTorch CNN backbones."""
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+
+        target_layer.register_forward_hook(self.save_activation)
+        target_layer.register_full_backward_hook(self.save_gradient)
+
+    def save_activation(self, module, input, output):
+        self.activations = output
+
+    def save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
+
+    def __call__(self, x, class_idx=None):
+        self.model.eval()
+        output = self.model(x)
+
+        if class_idx is None:
+            class_idx = output.argmax(dim=1).item()
+
+        self.model.zero_grad()
+        score = output[0, class_idx]
+        score.backward()
+
+        gradients = self.gradients.data.cpu().numpy()[0]
+        activations = self.activations.data.cpu().numpy()[0]
+
+        weights = np.mean(gradients, axis=(1, 2))
+        cam = np.zeros(activations.shape[1:], dtype=np.float32)
+
+        for i, w in enumerate(weights):
+            cam += w * activations[i]
+
+        cam = np.maximum(cam, 0)
+        if cam.max() > 0:
+            cam = cam / cam.max()
+
+        return cam, class_idx
+
+
+def generate_evaluation_artifacts(model, loader, dataset_obj, device, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    model.eval()
+    all_preds, all_targets = [], []
+
+    with torch.no_grad():
+        for images, targets in loader:
+            images = images.to(device)
+            outputs = model(images)
+            preds = outputs.argmax(dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+
+    target_names = [dataset_obj.idx_to_label[i] for i in range(len(dataset_obj.label_to_idx))]
+
+    # Classification Report
+    report = classification_report(all_targets, all_preds, target_names=target_names, output_dict=True, zero_division=0)
+    df_report = pd.DataFrame(report).transpose()
+    df_report.to_csv(out_dir / "classification_report.csv")
+
+    # Confusion Matrix Plot
+    cm = confusion_matrix(all_targets, all_preds)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=target_names, yticklabels=target_names)
+    plt.title("Confusion Matrix")
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(out_dir / "confusion_matrix.png", dpi=300)
+    plt.close()
+
+    print(f"Evaluation artifacts saved to: {out_dir}")
+
+
+def run(config, exp_name: str = "smoke_test", dataset_type: str = "fish"):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    exp_dir = config.paths.outputs / "experiments" / exp_name
+    ckpt_path = exp_dir / "best_model.pth"
+
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
+
+    manifest_path = config.paths.datasets / "manifests" / f"{dataset_type}_manifest_deduped.csv"
+    df = pd.read_csv(manifest_path)
+    df_test = df[df["split"] == "test"].reset_index(drop=True)
+
+    if df_test.empty:
+        df_test = df[df["split"] == "val"].reset_index(drop=True)
+
+    train_manifest = df[df["split"] == "train"].reset_index(drop=True)
+    unique_labels = sorted(train_manifest["label"].unique())
+    label_to_idx = {lbl: i for i, lbl in enumerate(unique_labels)}
+
+    test_transform = get_transforms(img_size=config.training.img_size, is_train=False)
+    test_ds = AquaDataset(df_test, label_to_idx=label_to_idx, transform=test_transform)
+    test_loader = torch.utils.data.DataLoader(test_ds, batch_size=config.training.batch_size, shuffle=False)
+
+    model = build_model("resnet34", num_classes=len(label_to_idx), pretrained=False)
+    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
+    model = model.to(device)
+
+    generate_evaluation_artifacts(model, test_loader, test_ds, device, exp_dir)
+
+
+if __name__ == "__main__":
+    from config import load_config
+    cfg = load_config()
+    run(cfg, exp_name="smoke_test", dataset_type="fish")
+
+
+
+=== explainability.py ===
+import torch
+import cv2
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+from aquavision.preprocessing import letterbox_resize
+from aquavision.fusion import AquaVisionMultimodalModel
+
+class AquaGradCAM:
+    """Generates Class Activation Maps (Grad-CAM) for disease diagnostics."""
+    def __init__(self, species: str = "fish", fold: int = 0):
+        self.species = species
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        manifest_path = Path("datasets/processed") / f"{species}_processed_manifest.csv"
+        df = pd.read_csv(manifest_path)
+        self.classes = sorted(df["label"].unique())
+        self.tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in df.columns]
+
+        checkpoint_path = Path("checkpoints") / f"{species}_best_model_fold{fold}.pt"
+        self.model = AquaVisionMultimodalModel(
+            num_classes=len(self.classes),
+            num_tabular_features=len(self.tab_cols),
+            backbone_name="resnet18"
+        ).to(self.device)
+
+        self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device, weights_only=True))
+        self.model.eval()
+
+        self.transform = A.Compose([
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+
+        # Hook targets final ResNet layer directly via self.model.backbone
+        self.gradients = None
+        self.activations = None
+        target_layer = self.model.backbone.layer4[-1]
+        target_layer.register_forward_hook(self._save_activation)
+        target_layer.register_full_backward_hook(self._save_gradient)
+
+    def _save_activation(self, module, input, output):
+        self.activations = output
+
+    def _save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
+
+    def generate_heatmap(self, image_path: str, water_quality_dict: dict = None, output_path: str = "datasets/gradcam_result.jpg"):
+        orig_img = cv2.imread(image_path)
+        if orig_img is None:
+            raise FileNotFoundError(f"Image not found: {image_path}")
+
+        rgb_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
+        resized_img = letterbox_resize(rgb_img, target_size=224, species=self.species)
+        img_tensor = self.transform(image=resized_img)["image"].unsqueeze(0).to(self.device)
+
+        if self.tab_cols and water_quality_dict:
+            temp = water_quality_dict.get("temperature", 25.0)
+            do = water_quality_dict.get("dissolved_oxygen", 6.0)
+            ph = water_quality_dict.get("ph", 7.5)
+            ammonia = water_quality_dict.get("ammonia", 0.05)
+
+            water_quality_dict["temp_do_ratio"] = temp / (do + 1e-5)
+            water_quality_dict["ammonia_toxicity_index"] = ammonia * (10 ** (ph - 7.0)) * (temp / 25.0)
+            water_quality_dict["stress_score"] = (abs(ph - 7.5) * 0.3) + (ammonia * 10.0 * 0.4) + (max(0, 6.0 - do) * 0.3)
+
+            tab_vector = [float(water_quality_dict.get(c, 0.0)) for c in self.tab_cols]
+            tab_tensor = torch.tensor([tab_vector], dtype=torch.float32).to(self.device)
+            logits = self.model(img_tensor, tab_tensor)
+        else:
+            logits = self.model(img_tensor)
+
+        pred_idx = torch.argmax(logits, dim=1).item()
+        pred_label = self.classes[pred_idx]
+
+        self.model.zero_grad()
+        target_score = logits[0, pred_idx]
+        target_score.backward()
+
+        pooled_gradients = torch.mean(self.gradients, dim=[0, 2, 3])
+        activations = self.activations[0]
+
+        for i in range(activations.size(0)):
+            activations[i, :, :] *= pooled_gradients[i]
+
+        heatmap = torch.mean(activations, dim=0).cpu().detach().numpy()
+        heatmap = np.maximum(heatmap, 0)
+        if np.max(heatmap) != 0:
+            heatmap /= np.max(heatmap)
+
+        heatmap_resized = cv2.resize(heatmap, (224, 224))
+        heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+        
+        overlay = cv2.addWeighted(cv2.cvtColor(resized_img, cv2.COLOR_RGB2BGR), 0.6, heatmap_colored, 0.4, 0)
+        
+        cv2.imwrite(output_path, overlay)
+        print(f"  > Generated Grad-CAM heatmap for class '{pred_label}' -> Saved to: {output_path}")
+        return pred_label, output_path
+
+if __name__ == "__main__":
+    df_fish = pd.read_csv("datasets/processed/fish_processed_manifest.csv")
+    sample_img = df_fish.iloc[0]["image_path"]
+
+    cam_engine = AquaGradCAM(species="fish", fold=0)
+    sample_wq = {"temperature": 28.5, "ph": 8.2, "dissolved_oxygen": 4.1, "ammonia": 0.45}
+    cam_engine.generate_heatmap(sample_img, sample_wq)
+
+
+
+=== export_onnx.py ===
+import torch
+from pathlib import Path
+import pandas as pd
+
+from aquavision.fusion import AquaVisionMultimodalModel
+
+def export_species_onnx(species: str = "fish", fold: int = 0):
+    device = torch.device("cpu")
+    checkpoint_path = Path("checkpoints") / f"{species}_best_model_fold{fold}.pt"
+    manifest_path = Path("datasets/processed") / f"{species}_processed_manifest.csv"
+
+    if not checkpoint_path.exists():
+        print(f"⚠️ Checkpoint missing for {species}: {checkpoint_path}")
+        return
+
+    # Load state dict directly to inspect dimensions
+    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+
+    # 1. Dynamically inspect tabular input feature count from weights
+    if "tabular_mlp.net.0.weight" in state_dict:
+        num_tabular_features = state_dict["tabular_mlp.net.0.weight"].shape[1]
+    else:
+        num_tabular_features = 0
+
+    # 2. Dynamically inspect class count from output layer weights
+    classifier_weight_keys = [k for k in state_dict.keys() if "classifier" in k and "weight" in k]
+    if classifier_weight_keys:
+        num_classes = state_dict[classifier_weight_keys[-1]].shape[0]
+    else:
+        num_classes = 8 # Fallback standard
+
+    print(f"[{species.upper()}] Detected Checkpoint Specs -> Num Classes: {num_classes}, Tabular Features: {num_tabular_features}")
+
+    # Build exact matching model instance
+    model = AquaVisionMultimodalModel(
+        num_classes=num_classes,
+        num_tabular_features=num_tabular_features,
+        backbone_name="resnet18"
+    ).to(device)
+
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    # Build dummy input tensors matching checkpoint configuration
+    dummy_image = torch.randn(1, 3, 224, 224, device=device)
+    export_dir = Path("exports")
+    export_dir.mkdir(parents=True, exist_ok=True)
+    onnx_path = export_dir / f"{species}_model_fold{fold}.onnx"
+
+    if num_tabular_features > 0:
+        dummy_tabular = torch.randn(1, num_tabular_features, device=device)
+        dummy_inputs = (dummy_image, dummy_tabular)
+        input_names = ["image_input", "tabular_input"]
+        dynamic_axes = {
+            "image_input": {0: "batch_size"},
+            "tabular_input": {0: "batch_size"},
+            "logits": {0: "batch_size"}
+        }
+    else:
+        dummy_inputs = (dummy_image,)
+        input_names = ["image_input"]
+        dynamic_axes = {
+            "image_input": {0: "batch_size"},
+            "logits": {0: "batch_size"}
+        }
+
+    torch.onnx.export(
+        model,
+        dummy_inputs,
+        str(onnx_path),
+        export_params=True,
+        opset_version=14,
+        do_constant_folding=True,
+        input_names=input_names,
+        output_names=["logits"],
+        dynamic_axes=dynamic_axes
+    )
+
+    print(f"✅ [{species.upper()}] Successfully exported ONNX model to {onnx_path}\n")
+
+if __name__ == "__main__":
+    for sp in ["fish", "shrimp"]:
+        export_species_onnx(species=sp, fold=0)
+
+
+
+=== fusion.py ===
+import torch
+import torch.nn as nn
+import torchvision.models as models
+
+
+class TabularMLP(nn.Module):
+    """Multi-Layer Perceptron for tabular water quality parameters."""
+    def __init__(self, in_features: int, hidden_dim: int = 64, out_dim: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_features, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, out_dim),
+            nn.BatchNorm1d(out_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class AquaVisionMultimodalModel(nn.Module):
+    """Fuses CNN image backbone representations with tabular water quality vectors."""
+    def __init__(
+        self,
+        num_classes: int,
+        num_tabular_features: int = 0,
+        backbone_name: str = "resnet18",
+        pretrained: bool = True
+    ):
+        super().__init__()
+        self.num_tabular_features = num_tabular_features
+
+        # 1. Vision Backbone Setup
+        if backbone_name == "resnet18":
+            weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+            base_model = models.resnet18(weights=weights)
+            img_feat_dim = base_model.fc.in_features
+            base_model.fc = nn.Identity()
+            self.backbone = base_model
+        else:
+            weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
+            base_model = models.efficientnet_b0(weights=weights)
+            img_feat_dim = base_model.classifier[1].in_features
+            base_model.classifier = nn.Identity()
+            self.backbone = base_model
+
+        # 2. Optional Tabular Sub-network Setup
+        if num_tabular_features > 0:
+            self.tabular_mlp = TabularMLP(in_features=num_tabular_features, out_dim=32)
+            fusion_dim = img_feat_dim + 32
+        else:
+            self.tabular_mlp = None
+            fusion_dim = img_feat_dim
+
+        # 3. Final Multi-Class Classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, image: torch.Tensor, tabular: torch.Tensor = None) -> torch.Tensor:
+        img_feats = self.backbone(image)
+
+        if self.tabular_mlp is not None and tabular is not None:
+            tab_feats = self.tabular_mlp(tabular)
+            fused = torch.cat([img_feats, tab_feats], dim=1)
+        else:
+            fused = img_feats
+
+        return self.classifier(fused)
+
+
+
+=== manifests.py ===
+import os
+from pathlib import Path
+import pandas as pd
+from config import load_config
+
+def find_species_dir(base_paths, species_name: str) -> Path:
+    """Finds existing species directory across common dataset folder structures."""
+    for base in base_paths:
+        if base is None:
+            continue
+        base = Path(base)
+        # Direct check: root/species
+        candidate = base / species_name
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+        # Nested check: root/raw/species
+        candidate_raw = base / "raw" / species_name
+        if candidate_raw.exists() and candidate_raw.is_dir():
+            return candidate_raw
+    return None
+
+def build_manifest_for_species(species_dir: Path, species_name: str) -> pd.DataFrame:
+    records = []
+    if species_dir is None or not species_dir.exists():
+        print(f"Warning: Directory for '{species_name}' could not be located.")
+        return pd.DataFrame()
+
+    valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+    for root, _, files in os.walk(species_dir):
+        for file in files:
+            ext = Path(file).suffix.lower()
+            if ext in valid_exts:
+                full_path = Path(root) / file
+                class_label = full_path.parent.name
+                
+                parts = [p.lower() for p in full_path.parts]
+                if "val" in parts or "validation" in parts:
+                    split = "val"
+                elif "test" in parts:
+                    split = "test"
+                else:
+                    split = "train"
+
+                is_aug = file.lower().startswith("aug_") or "_aug_" in file.lower()
+
+                records.append({
+                    "image_path": str(full_path.resolve()),
+                    "label": class_label,
+                    "species": species_name,
+                    "split": split,
+                    "is_augmented": is_aug
+                })
+
+    df = pd.DataFrame(records)
+    print(f"[{species_name.capitalize()}] Found {len(df)} images across {df['label'].nunique() if not df.empty else 0} classes.")
+    return df
+
+def run(config):
+    manifest_dir = Path("datasets/manifests")
+    if hasattr(config.paths, "datasets"):
+        manifest_dir = config.paths.datasets / "manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Candidate root folders to search
+    candidate_roots = [
+        Path("data"),
+        Path("datasets"),
+        getattr(config.paths, "datasets", None),
+        Path("."),
+    ]
+
+    for species in ["fish", "shrimp"]:
+        species_dir = find_species_dir(candidate_roots, species)
+        if species_dir:
+            print(f"Located '{species}' folder at: {species_dir.resolve()}")
+        df_manifest = build_manifest_for_species(species_dir, species)
+        
+        if not df_manifest.empty:
+            out_file = manifest_dir / f"{species}_manifest.csv"
+            df_manifest.to_csv(out_file, index=False)
+            print(f"Saved regenerated manifest: {out_file}\n")
+
+if __name__ == "__main__":
+    cfg = load_config()
+    run(cfg)
+
+
+
+=== models.py ===
+import torch
+import torch.nn as nn
+import timm
+
+
+def build_model(
+    model_name: str = "resnet34",
+    num_classes: int = 8,
+    pretrained: bool = True,
+    drop_rate: float = 0.2
+) -> nn.Module:
+    """Factory function leveraging timm to create computer vision backbones."""
+    model = timm.create_model(
+        model_name,
+        pretrained=pretrained,
+        num_classes=num_classes,
+        drop_rate=drop_rate
+    )
+    return model
+
+
+if __name__ == "__main__":
+    test_model = build_model("resnet34", num_classes=8, pretrained=False)
+    dummy_input = torch.randn(2, 3, 224, 224)
+    out = test_model(dummy_input)
+    print(f"Model built successfully. Output batch shape: {out.shape}")
+
+
+
+=== predict.py ===
+import torch
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import joblib
+import cv2
+from pathlib import Path
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+from aquavision.preprocessing import letterbox_resize
+from aquavision.fusion import AquaVisionMultimodalModel
+
+class AquaPredictor:
+    def __init__(self, species: str = "fish", fold: int = 0):
+        self.species = species
+        self.fold = fold
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        manifest_path = Path("datasets/processed") / f"{species}_processed_manifest.csv"
+        df = pd.read_csv(manifest_path)
+        self.classes = sorted(df["label"].unique())
+        self.tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in df.columns]
+
+        # Bug 4.6 Fix: Load fold-matched scaler
+        scaler_path = Path("checkpoints") / f"{species}_scaler_fold{fold}.pkl"
+        self.scaler = joblib.load(scaler_path) if scaler_path.exists() else None
+
+        checkpoint_path = Path("checkpoints") / f"{species}_best_model_fold{fold}.pt"
+        self.model = AquaVisionMultimodalModel(num_classes=len(self.classes), num_tabular_features=len(self.tab_cols), backbone_name="resnet18").to(self.device)
+        self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device, weights_only=True))
+        self.model.eval()
+
+        self.transform = A.Compose([
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+
+    def predict(self, image_input, water_quality_dict: dict = None):
+        if isinstance(image_input, str):
+            img = cv2.imread(image_input)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        else:
+            img = image_input
+
+        img_resized = letterbox_resize(img, target_size=224, species=self.species)
+        img_tensor = self.transform(image=img_resized)["image"].unsqueeze(0).to(self.device)
+
+        if self.tab_cols and water_quality_dict:
+            wq = water_quality_dict.copy()
+            wq["temp_do_ratio"] = wq.get("temperature", 25.0) / (wq.get("dissolved_oxygen", 6.0) + 1e-5)
+            wq["ammonia_toxicity_index"] = wq.get("ammonia", 0.01) * (10 ** (wq.get("ph", 7.5) - 7.0)) * (wq.get("temperature", 25.0) / 25.0)
+            wq["stress_score"] = (abs(wq.get("ph", 7.5) - 7.5) * 0.3) + (wq.get("ammonia", 0.01) * 10.0 * 0.4) + (max(0, 6.0 - wq.get("dissolved_oxygen", 6.0)) * 0.3)
+
+            raw_df = pd.DataFrame([[wq[c] for c in self.tab_cols]], columns=self.tab_cols)
+            scaled_vector = self.scaler.transform(raw_df)[0] if self.scaler else raw_df.values[0]
+            tab_tensor = torch.tensor(scaled_vector, dtype=torch.float32).unsqueeze(0).to(self.device)
+            logits = self.model(img_tensor, tab_tensor)
+        else:
+            logits = self.model(img_tensor)
+
+        probs = F.softmax(logits, dim=1).squeeze().cpu().detach().numpy()
+        top_idx = int(np.argmax(probs))
+        return {
+            "prediction": self.classes[top_idx],
+            "confidence": float(probs[top_idx]),
+            "all_probabilities": {cls: float(p) for cls, p in zip(self.classes, probs)}
+        }
+
+
+
+=== predict_legacy.py ===
+import torch
+import numpy as np
+import pandas as pd
+import cv2
+from pathlib import Path
+from sklearn.preprocessing import StandardScaler
+
+from aquavision.dataset import get_transforms
+from aquavision.fusion import FusionModel
+
+
+class AquaPredictor:
+    """Unified multimodal inference pipeline for real-time disease diagnosis."""
+    def __init__(self, config, dataset_type="fish"):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Load Manifest to reconstruct class mappings
+        manifest_path = config.paths.datasets / "manifests" / f"{dataset_type}_manifest_deduped.csv"
+        df_manifest = pd.read_csv(manifest_path)
+        train_manifest = df_manifest[df_manifest["split"] == "train"].reset_index(drop=True)
+        unique_labels = sorted(train_manifest["label"].unique())
+        
+        self.label_to_idx = {lbl: i for i, lbl in enumerate(unique_labels)}
+        self.idx_to_label = {v: k for k, v in self.label_to_idx.items()}
+        num_classes = len(unique_labels)
+
+        # Fit Tabular Scaler on historical water quality data
+        wq_path = config.paths.datasets / "water_quality" / f"{dataset_type}_water_quality.csv"
+        df_wq = pd.read_csv(wq_path)
+        tab_cols = ["ph", "temperature", "dissolved_oxygen", "salinity", "ammonia", "turbidity"]
+        
+        self.scaler = StandardScaler()
+        self.scaler.fit(df_wq[tab_cols].values.astype(np.float32))
+
+        # Load Fusion Model Checkpoint
+        ckpt_path = config.paths.outputs / "experiments" / f"{dataset_type}_multimodal_fusion" / "best_fusion_model.pth"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
+
+        self.model = FusionModel("resnet34", num_classes=num_classes, pretrained=False).to(self.device)
+        self.model.load_state_dict(torch.load(ckpt_path, map_location=self.device, weights_only=True))
+        self.model.eval()
+
+        self.transform = get_transforms(img_size=config.training.img_size, is_train=False)
+
+    def predict(self, image_input, ph: float, temp: float, do: float, salinity: float, ammonia: float, turbidity: float):
+        # Image Preprocessing
+        if isinstance(image_input, str) or isinstance(image_input, Path):
+            img = cv2.imread(str(image_input))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        else:
+            img = image_input  # RGB NumPy array from Gradio
+
+        transformed = self.transform(image=img)["image"].unsqueeze(0).to(self.device)
+
+        # Tabular Preprocessing
+        tab_raw = np.array([[ph, temp, do, salinity, ammonia, turbidity]], dtype=np.float32)
+        tab_scaled = torch.tensor(self.scaler.transform(tab_raw), dtype=torch.float32).to(self.device)
+
+        # Forward Pass
+        with torch.no_grad():
+            outputs = self.model(transformed, tab_scaled)
+            probs = torch.softmax(outputs, dim=1).cpu().numpy()[0]
+
+        predictions = {self.idx_to_label[i]: float(probs[i]) for i in range(len(probs))}
+        top_pred = self.idx_to_label[np.argmax(probs)]
+        confidence = float(np.max(probs))
+
+        return predictions, top_pred, confidence
+
+
+if __name__ == "__main__":
+    from config import load_config
+    cfg = load_config()
+    predictor = AquaPredictor(cfg, dataset_type="fish")
+    print("Inference Engine loaded successfully!")
+
+
+
+=== preprocessing.py ===
+import cv2
+import numpy as np
+
+def pad_to_square(img: np.ndarray, fill_color: tuple = (0, 0, 0)) -> np.ndarray:
+    """Pads an image with a solid color to make it square while keeping content centered."""
+    h, w = img.shape[:2]
+    if h == w:
+        return img
+
+    max_side = max(h, w)
+    top = (max_side - h) // 2
+    bottom = max_side - h - top
+    left = (max_side - w) // 2
+    right = max_side - w - left
+
+    return cv2.copyMakeBorder(
+        img,
+        top,
+        bottom,
+        left,
+        right,
+        cv2.BORDER_CONSTANT,
+        value=fill_color
+    )
+
+def letterbox_resize(img: np.ndarray, target_size: int = 224, species: str = "fish") -> np.ndarray:
+    """Pads image to square and resizes using optimal interpolation based on up/downscaling."""
+    # Step 1: Select species-aware background fill
+    fill_color = (255, 255, 255) if species.lower() == "shrimp" else (0, 0, 0)
+    
+    # Step 2: Pad canvas to square (1:1 aspect ratio)
+    squared_img = pad_to_square(img, fill_color=fill_color)
+    
+    # Step 3: Choose interpolation method
+    orig_side = squared_img.shape[0]
+    if orig_side > target_size:
+        interp = cv2.INTER_AREA    # Downscaling (avoids aliasing)
+    else:
+        interp = cv2.INTER_CUBIC   # Upscaling (smoother textures)
+
+    return cv2.resize(squared_img, (target_size, target_size), interpolation=interp)
+
+
+
+=== rebuild_manifests.py ===
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.model_selection import StratifiedKFold
+
+
+def build_robust_manifest(species: str = "fish"):
+    raw_dir = Path("datasets") / species
+    processed_dir = Path("datasets/processed")
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    records = []
+    classes = set()
+
+    # Known class keywords for parsing test_split filenames
+    known_classes = [
+        "Bacterial diseases - Aeromoniasis",
+        "Bacterial gill disease",
+        "Bacterial Red disease",
+        "EUS",
+        "Fungal diseases Saprolegniasis",  # <-- Added missing fungal class
+        "Healthy Fish",
+        "Parasitic diseases",
+        "Viral diseases White tail disease",
+        "BG", "Healthy", "WSSV", "WSSV_BG"
+    ]
+
+    for img_path in raw_dir.rglob("*.*"):
+        if img_path.suffix.lower() not in [".jpg", ".jpeg", ".png", ".bmp"]:
+            continue
+
+        filename = img_path.name
+        rel_parts = img_path.parts
+
+        # Recover held-out test split
+        is_test = "test_split" in rel_parts
+        assigned_label = None
+
+        if is_test:
+            for cls in sorted(known_classes, key=len, reverse=True):
+                if filename.startswith(cls):
+                    assigned_label = cls
+                    break
+            if not assigned_label:
+                continue
+        else:
+            assigned_label = img_path.parent.name
+
+        # Exclude fake/temp split labels
+        if assigned_label in ["test_split", "train_split", species]:
+            continue
+
+        classes.add(assigned_label)
+        records.append({
+            "image_name": filename,
+            "image_path": str(img_path.resolve()),
+            "label": assigned_label,
+            "is_test": is_test,
+            "is_augmented": "aug" in filename.lower()
+        })
+
+    df = pd.DataFrame(records)
+    print(f"[{species.upper()}] Parsed {len(df)} images ({df['is_test'].sum()} held-out test samples)")
+
+    # Assign K-Fold to training data, -1 to test set
+    df["fold"] = -1
+    train_mask = ~df["is_test"]
+
+    # Ensure there is training data to split
+    if train_mask.sum() > 0:
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        train_df = df[train_mask].reset_index(drop=True)
+
+        for fold_idx, (_, val_idx) in enumerate(skf.split(train_df, train_df["label"])):
+            train_df.loc[val_idx, "fold"] = fold_idx
+
+        df.loc[train_mask, "fold"] = train_df["fold"].values
+
+    # NOTE: Tabular water quality merge block completely removed
+
+    out_path = processed_dir / f"{species}_processed_manifest.csv"
+    df.to_csv(out_path, index=False)
+    print(f"[{species.upper()}] Manifest saved to {out_path} with {df['fold'].nunique() - 1} train folds + test split.")
+
+
+if __name__ == "__main__":
+    for sp in ["fish", "shrimp"]:
+        build_robust_manifest(species=sp)
+
+
+=== save_scalers.py ===
+import joblib
+import pandas as pd
+from pathlib import Path
+from sklearn.preprocessing import StandardScaler
+
+checkpoints_dir = Path("checkpoints")
+checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+for species in ["fish", "shrimp"]:
+    manifest_path = Path("datasets/processed") / f"{species}_processed_manifest.csv"
+    if not manifest_path.exists():
+        continue
+    
+    df = pd.read_csv(manifest_path)
+    tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in df.columns]
+    
+    if tab_cols:
+        scaler = StandardScaler()
+        scaler.fit(df[tab_cols].fillna(0.0))
+        scaler_path = checkpoints_dir / f"{species}_scaler.pkl"
+        joblib.dump(scaler, scaler_path)
+        print(f"[{species.upper()}] Scaler successfully saved to {scaler_path}")
+
+
+
+=== test_pipeline.py ===
+import torch
+import pandas as pd
+from torch.utils.data import DataLoader
+from aquavision.dataset import AquaDataset
+from aquavision.fusion import AquaVisionMultimodalModel
+
+def run_test():
+    print("==========================================")
+    print("      AQUAVISION PIPELINE SANITY TEST     ")
+    print("==========================================")
+
+    # 1. Load Processed Manifest
+    manifest_path = "datasets/processed/fish_processed_manifest.csv"
+    print(f"[1/4] Loading manifest: {manifest_path}")
+    df = pd.read_csv(manifest_path)
+    
+    unique_labels = sorted(df['label'].unique())
+    label2idx = {lbl: idx for idx, lbl in enumerate(unique_labels)}
+    df['label_idx'] = df['label'].map(label2idx)
+    num_classes = len(unique_labels)
+    print(f"      Loaded {len(df)} rows across {num_classes} target classes.")
+
+    # 2. Check Tabular Features
+    tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in df.columns]
+    print(f"[2/4] Tabular features detected ({len(tab_cols)}): {tab_cols}")
+
+    # 3. Test Dataset & DataLoader Batch Processing
+    print("[3/4] Testing AquaDataset & Letterbox Resizing...")
+    ds = AquaDataset(df, img_size=224, is_train=True, species="fish")
+    loader = DataLoader(ds, batch_size=4, shuffle=True)
+    
+    images, labels = next(iter(loader))
+    print(f"      Batch Image Shape : {tuple(images.shape)} (Expected: [4, 3, 224, 224])")
+    print(f"      Batch Target Labels: {labels.tolist()}")
+
+    # 4. Model Forward Pass Verification
+    print("[4/4] Testing Multimodal Model Forward Pass...")
+    model = AquaVisionMultimodalModel(
+        num_classes=num_classes,
+        num_tabular_features=len(tab_cols),
+        backbone_name="resnet18"
+    )
+    model.eval()
+
+    with torch.no_grad():
+        if len(tab_cols) > 0:
+            dummy_tab = torch.randn(4, len(tab_cols))
+            logits = model(images, dummy_tab)
+        else:
+            logits = model(images)
+
+    print(f"      Model Logits Output Shape: {tuple(logits.shape)} (Expected: [4, {num_classes}])")
+    print("==========================================")
+    print(" SUCCESS: All pipeline components are functional!")
+    print("==========================================")
+
+if __name__ == "__main__":
+    run_test()
+
+
+
+=== train.py ===
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import pandas as pd
+import numpy as np
+import joblib
+from pathlib import Path
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, f1_score
+
+from aquavision.dataset import AquaDataset
+from aquavision.fusion import AquaVisionMultimodalModel
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0.0
+    for batch in dataloader:
+        optimizer.zero_grad()
+        if len(batch) == 3:
+            images, tabular, labels = batch
+            images, tabular, labels = images.to(device), tabular.to(device), labels.to(device)
+            outputs = model(images, tabular)
+        else:
+            images, labels = batch
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * images.size(0)
+    return total_loss / len(dataloader.dataset)
+
+def evaluate(model, dataloader, device):
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for batch in dataloader:
+            if len(batch) == 3:
+                images, tabular, labels = batch
+                images, tabular = images.to(device), tabular.to(device)
+                outputs = model(images, tabular)
+            else:
+                images, labels = batch
+                images = images.to(device)
+                outputs = model(images)
+
+            preds = torch.argmax(outputs, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.numpy())
+
+    acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average="macro")
+    return acc, f1
+
+def run_cross_validation(species: str = "fish", epochs: int = 25, patience: int = 5, min_epochs: int = 10, batch_size: int = 16, lr: float = 3e-4):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n--- Running 5-Fold Cross-Validation: {species.upper()} ---")
+
+    manifest_path = Path("datasets/processed") / f"{species}_processed_manifest.csv"
+    if not manifest_path.exists():
+        print(f"Manifest missing for {species}")
+        return
+
+    df = pd.read_csv(manifest_path)
+    
+    # Strictly isolate train/val data (exclude fold == -1)
+    cv_df = df[df["fold"] >= 0].copy().reset_index(drop=True)
+
+    unique_labels = sorted(df["label"].unique())
+    label2idx = {lbl: idx for idx, lbl in enumerate(unique_labels)}
+    cv_df["label_idx"] = cv_df["label"].map(label2idx)
+
+    tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in cv_df.columns]
+    checkpoints_dir = Path("checkpoints")
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+    fold_f1s = []
+
+    for fold in range(5):
+        train_df = cv_df[cv_df["fold"] != fold].copy()
+        val_df = cv_df[cv_df["fold"] == fold].copy()
+
+        if tab_cols:
+            scaler = StandardScaler()
+            train_df[tab_cols] = scaler.fit_transform(train_df[tab_cols].fillna(0.0))
+            val_df[tab_cols] = scaler.transform(val_df[tab_cols].fillna(0.0))
+            joblib.dump(scaler, checkpoints_dir / f"{species}_scaler_fold{fold}.pkl")
+
+        train_ds = AquaDataset(train_df, is_train=True, species=species, tab_cols=tab_cols)
+        val_ds = AquaDataset(val_df, is_train=False, species=species, tab_cols=tab_cols)
+
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+        model = AquaVisionMultimodalModel(
+            num_classes=len(unique_labels),
+            num_tabular_features=len(tab_cols),
+            backbone_name="resnet18"
+        ).to(device)
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+        best_f1, best_acc = 0.0, 0.0
+        patience_counter = 0
+        best_checkpoint = checkpoints_dir / f"{species}_best_model_fold{fold}.pt"
+
+        for epoch in range(epochs):
+            train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+            val_acc, val_f1 = evaluate(model, val_loader, device)
+            scheduler.step()
+
+            if val_f1 > best_f1 + 1e-4:
+                best_f1 = val_f1
+                best_acc = val_acc
+                torch.save(model.state_dict(), best_checkpoint)
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if epoch + 1 >= min_epochs and patience_counter >= patience:
+                print(f"  > Fold {fold} -> Early stopping at epoch {epoch + 1} | Best Val Acc: {best_acc:.4f} | Best Macro F1: {best_f1:.4f}")
+                break
+        else:
+            print(f"  > Fold {fold} -> Completed {epochs} epochs | Best Val Acc: {best_acc:.4f} | Best Macro F1: {best_f1:.4f}")
+
+        fold_f1s.append(best_f1)
+
+    mean_f1 = float(np.mean(fold_f1s))
+    std_f1 = float(np.std(fold_f1s))
+    print(f"[{species.upper()} STATISTICAL SUMMARY] Mean Macro F1: {mean_f1:.4f} (±{std_f1:.4f})")
+
+if __name__ == "__main__":
+    for species in ["fish", "shrimp"]:
+        run_cross_validation(species=species, epochs=25, patience=5, min_epochs=10)
+
+
+
+=== train_earlystop_bak.py ===
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import pandas as pd
+import numpy as np
+import joblib
+from pathlib import Path
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, f1_score
+
+from aquavision.dataset import AquaDataset
+from aquavision.fusion import AquaVisionMultimodalModel
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0.0
+    for batch in dataloader:
+        optimizer.zero_grad()
+        if len(batch) == 3:
+            images, tabular, labels = batch
+            images, tabular, labels = images.to(device), tabular.to(device), labels.to(device)
+            outputs = model(images, tabular)
+        else:
+            images, labels = batch
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * images.size(0)
+    return total_loss / len(dataloader.dataset)
+
+def evaluate(model, dataloader, device):
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for batch in dataloader:
+            if len(batch) == 3:
+                images, tabular, labels = batch
+                images, tabular = images.to(device), tabular.to(device)
+                outputs = model(images, tabular)
+            else:
+                images, labels = batch
+                images = images.to(device)
+                outputs = model(images)
+
+            preds = torch.argmax(outputs, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.numpy())
+
+    acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average="macro")
+    return acc, f1
+
+def run_cross_validation(species: str = "fish", epochs: int = 15, batch_size: int = 16, lr: float = 3e-4):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n--- Running 5-Fold Augmented Cross-Validation: {species.upper()} ---")
+
+    manifest_path = Path("datasets/processed") / f"{species}_processed_manifest.csv"
+    if not manifest_path.exists():
+        print(f"Manifest missing for {species}")
+        return
+
+    df = pd.read_csv(manifest_path)
+    unique_labels = sorted(df["label"].unique())
+    label2idx = {lbl: idx for idx, lbl in enumerate(unique_labels)}
+    df["label_idx"] = df["label"].map(label2idx)
+
+    tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in df.columns]
+    
+    # Save overall scaler for deployment/inference consistency
+    checkpoints_dir = Path("checkpoints")
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    if tab_cols:
+        full_scaler = StandardScaler()
+        full_scaler.fit(df[tab_cols].fillna(0.0))
+        joblib.dump(full_scaler, checkpoints_dir / f"{species}_scaler.pkl")
+
+    fold_f1s = []
+
+    for fold in range(5):
+        train_df = df[df["fold"] != fold].copy()
+        val_df = df[df["fold"] == fold].copy()
+
+        if tab_cols:
+            scaler = StandardScaler()
+            train_df[tab_cols] = scaler.fit_transform(train_df[tab_cols].fillna(0.0))
+            val_df[tab_cols] = scaler.transform(val_df[tab_cols].fillna(0.0))
+
+        train_ds = AquaDataset(train_df, is_train=True, species=species, tab_cols=tab_cols)
+        val_ds = AquaDataset(val_df, is_train=False, species=species, tab_cols=tab_cols)
+
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+        model = AquaVisionMultimodalModel(
+            num_classes=len(unique_labels),
+            num_tabular_features=len(tab_cols),
+            backbone_name="resnet18"
+        ).to(device)
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+        best_f1, best_acc = 0.0, 0.0
+        best_checkpoint = checkpoints_dir / f"{species}_best_model_fold{fold}.pt"
+
+        for epoch in range(epochs):
+            train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+            val_acc, val_f1 = evaluate(model, val_loader, device)
+            scheduler.step()
+
+            if val_f1 > best_f1:
+                best_f1 = val_f1
+                best_acc = val_acc
+                torch.save(model.state_dict(), best_checkpoint)
+
+        fold_f1s.append(best_f1)
+        print(f"  > Fold {fold} -> Best Val Acc: {best_acc:.4f} | Best Macro F1: {best_f1:.4f}")
+
+    mean_f1 = float(np.mean(fold_f1s))
+    var_f1 = float(np.var(fold_f1s))
+    std_f1 = float(np.std(fold_f1s))
+
+    print(f"\n[{species.upper()} STATISTICAL SUMMARY]")
+    print(f"  - Fold F1 Scores : {[round(x, 4) for x in fold_f1s]}")
+    print(f"  - Mean Macro F1   : {mean_f1:.4f}")
+    print(f"  - F1 Variance     : {var_f1:.6f}")
+    print(f"  - F1 Std Dev      : {std_f1:.4f}")
+    print(f"  - Stability Check : {'STABLE' if std_f1 < 0.03 else 'UNSTABLE'}")
+
+def main():
+    print("="*50)
+    print(" 5-FOLD CV WITH ONLINE AUGMENTATIONS & COSINE SCHEDULER")
+    print("="*50)
+    for species in ["fish", "shrimp"]:
+        run_cross_validation(species=species, epochs=15)
+
+if __name__ == "__main__":
+    main()
+
+
+
+=== train_legacy.py ===
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, f1_score
+
+from aquavision.dataset import AquaDataset
+from aquavision.fusion import AquaVisionMultimodalModel
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    running_loss = 0.0
+    all_preds, all_labels = [], []
+
+    for batch in loader:
+        if len(batch) == 3:
+            images, tabular, labels = batch
+            images, tabular, labels = images.to(device), tabular.to(device), labels.to(device)
+            outputs = model(images, tabular)
+        else:
+            images, labels = batch
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+
+        loss = criterion(outputs, labels)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+        preds = torch.argmax(outputs, dim=1)
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_acc = accuracy_score(all_labels, all_preds)
+    epoch_f1 = f1_score(all_labels, all_preds, average="macro")
+    return epoch_loss, epoch_acc, epoch_f1
+
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    all_preds, all_labels = [], []
+
+    with torch.no_grad():
+        for batch in loader:
+            if len(batch) == 3:
+                images, tabular, labels = batch
+                images, tabular, labels = images.to(device), tabular.to(device), labels.to(device)
+                outputs = model(images, tabular)
+            else:
+                images, labels = batch
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+
+            loss = criterion(outputs, labels)
+            running_loss += loss.item() * images.size(0)
+            preds = torch.argmax(outputs, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    val_loss = running_loss / len(loader.dataset)
+    val_acc = accuracy_score(all_labels, all_preds)
+    val_f1 = f1_score(all_labels, all_preds, average="macro")
+    return val_loss, val_acc, val_f1
+
+def run_fold(species: str, fold_to_run: int, epochs: int = 5, batch_size: int = 16, lr: float = 1e-4, device=None):
+    manifest_path = Path("datasets/processed") / f"{species}_processed_manifest.csv"
+    df = pd.read_csv(manifest_path)
+
+    unique_labels = sorted(df["label"].unique())
+    label2idx = {lbl: idx for idx, lbl in enumerate(unique_labels)}
+    df["label_idx"] = df["label"].map(label2idx)
+
+    tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in df.columns]
+
+    train_df = df[df["fold"] != fold_to_run].copy()
+    val_df = df[df["fold"] == fold_to_run].copy()
+
+    if tab_cols:
+        scaler = StandardScaler()
+        train_df[tab_cols] = scaler.fit_transform(train_df[tab_cols].fillna(0.0))
+        val_df[tab_cols] = scaler.transform(val_df[tab_cols].fillna(0.0))
+
+    train_ds = AquaDataset(train_df, img_size=224, is_train=True, species=species, tab_cols=tab_cols)
+    val_ds = AquaDataset(val_df, img_size=224, is_train=False, species=species, tab_cols=tab_cols)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    model = AquaVisionMultimodalModel(
+        num_classes=len(unique_labels),
+        num_tabular_features=len(tab_cols),
+        backbone_name="resnet18"
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    checkpoints_dir = Path("checkpoints")
+    checkpoints_dir.mkdir(exist_ok=True)
+
+    best_val_f1 = 0.0
+    best_val_acc = 0.0
+
+    for epoch in range(1, epochs + 1):
+        tr_loss, tr_acc, tr_f1 = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        val_loss, val_acc, val_f1 = evaluate(model, val_loader, criterion, device)
+        scheduler.step()
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_val_acc = val_acc
+            save_path = checkpoints_dir / f"{species}_best_model_fold{fold_to_run}.pt"
+            torch.save(model.state_dict(), save_path)
+
+    print(f"  > Fold {fold_to_run} -> Best Val Acc: {best_val_acc:.4f} | Best Macro F1: {best_val_f1:.4f}")
+    return best_val_acc, best_val_f1
+
+def run_full_cross_validation(epochs: int = 5):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"==================================================")
+    print(f" 5-FOLD CV & VARIANCE ANALYSIS | Device: {device}")
+    print(f"==================================================\n")
+    
+    summary_results = []
+    
+    for species in ["fish", "shrimp"]:
+        manifest_path = Path("datasets/processed") / f"{species}_processed_manifest.csv"
+        if not manifest_path.exists():
+            continue
+            
+        print(f"--- Running 5-Fold Cross-Validation: {species.upper()} ---")
+        fold_accs, fold_f1s = [], []
+        
+        for fold in range(5):
+            acc, f1 = run_fold(species=species, fold_to_run=fold, epochs=epochs, device=device)
+            fold_accs.append(acc)
+            fold_f1s.append(f1)
+            
+        mean_acc = float(np.mean(fold_accs))
+        mean_f1 = float(np.mean(fold_f1s))
+        var_f1 = float(np.var(fold_f1s))
+        std_f1 = float(np.std(fold_f1s))
+        
+        # Stability assessment threshold
+        status = "STABLE" if std_f1 <= 0.03 else "HIGH VARIANCE (Investigate)"
+
+        print(f"\n[{species.upper()} STATISTICAL SUMMARY]")
+        print(f"  - Fold F1 Scores : {[round(f, 4) for f in fold_f1s]}")
+        print(f"  - Mean Macro F1   : {mean_f1:.4f}")
+        print(f"  - F1 Variance     : {var_f1:.6f}")
+        print(f"  - F1 Std Dev      : {std_f1:.4f}")
+        print(f"  - Stability Check : {status}")
+        print("\n" + "="*50 + "\n")
+        
+        summary_results.append({
+            "species": species,
+            "mean_accuracy": round(mean_acc, 4),
+            "mean_macro_f1": round(mean_f1, 4),
+            "f1_variance": round(var_f1, 6),
+            "f1_std_dev": round(std_f1, 4),
+            "status": status
+        })
+
+    df_res = pd.DataFrame(summary_results)
+    df_res.to_csv("datasets/cv_metrics.csv", index=False)
+    print("Saved 5-Fold CV analysis to datasets/cv_metrics.csv")
+
+if __name__ == "__main__":
+    run_full_cross_validation(epochs=5)
+
+
+
+=== verify_model.py ===
+import torch
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+import joblib
+from pathlib import Path
+import cv2
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from sklearn.metrics import classification_report, accuracy_score, f1_score
+
+from aquavision.preprocessing import letterbox_resize
+from aquavision.fusion import AquaVisionMultimodalModel
+
+def run_heldout_test_evaluation(species: str = "fish", fold: int = 0):
+    print(f"\n==================================================")
+    print(f" EVALUATING HELDOUT TEST SET ({species.upper()} - FOLD {fold} MODEL)")
+    print(f"==================================================")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    manifest_path = Path("datasets/processed") / f"{species}_processed_manifest.csv"
+    df = pd.read_csv(manifest_path)
+
+    test_df = df[df["fold"] == -1].reset_index(drop=True)
+    if len(test_df) == 0:
+        print(f"No held-out test samples (fold == -1) found for {species}.")
+        return
+
+    classes = sorted(df["label"].unique())
+    label2idx = {lbl: idx for idx, lbl in enumerate(classes)}
+    test_df["label_idx"] = test_df["label"].map(label2idx)
+
+    tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in df.columns]
+
+    scaler_path = Path("checkpoints") / f"{species}_scaler_fold{fold}.pkl"
+    scaler = joblib.load(scaler_path) if scaler_path.exists() else None
+
+    checkpoint_path = Path("checkpoints") / f"{species}_best_model_fold{fold}.pt"
+    model = AquaVisionMultimodalModel(num_classes=len(classes), num_tabular_features=len(tab_cols), backbone_name="resnet18").to(device)
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
+    model.eval()
+
+    transform = A.Compose([
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2()
+    ])
+
+    if tab_cols and scaler:
+        test_df[tab_cols] = scaler.transform(test_df[tab_cols].fillna(0.0))
+
+    y_true, y_pred = [], []
+
+    with torch.no_grad():
+        for idx, row in test_df.iterrows():
+            img = cv2.imread(row["image_path"])
+            if img is None:
+                continue
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = letterbox_resize(img, target_size=224, species=species)
+            img_tensor = transform(image=img)["image"].unsqueeze(0).to(device)
+
+            if tab_cols:
+                tab_vector = np.array([float(row[c]) for c in tab_cols], dtype=np.float32)
+                tab_tensor = torch.tensor(tab_vector, dtype=torch.float32).unsqueeze(0).to(device)
+                logits = model(img_tensor, tab_tensor)
+            else:
+                logits = model(img_tensor)
+
+            probs = F.softmax(logits, dim=1).squeeze().cpu().numpy()
+            pred_idx = int(np.argmax(probs))
+
+            y_true.append(row["label_idx"])
+            y_pred.append(pred_idx)
+
+    acc = accuracy_score(y_true, y_pred)
+    macro_f1 = f1_score(y_true, y_pred, average="macro")
+
+    print(f"Total Held-Out Test Samples: {len(test_df)}")
+    print(f"Test Accuracy : {acc*100:.2f}%")
+    print(f"Test Macro F1 : {macro_f1:.4f}\n")
+    print(classification_report(y_true, y_pred, target_names=classes, zero_division=0))
+
+if __name__ == "__main__":
+    run_heldout_test_evaluation(species="fish", fold=0)
+
+
+
+=== water_quality.py ===
+from pathlib import Path
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
+
+
+def generate_synthetic_water_data(df_manifest: pd.DataFrame, noise_rate: float = 0.07, seed: int = 42) -> pd.DataFrame:
+    """
+    Generates synthetic water quality parameters (pH, Temp, DO, Salinity, Ammonia, Turbidity)
+    correlated with image sample disease labels.
+    """
+    np.random.seed(seed)
+    records = []
+
+    for _, row in df_manifest.iterrows():
+        is_healthy = "healthy" in row["label"].lower()
+        
+        if is_healthy:
+            ph = np.random.normal(7.2, 0.3)
+            temp = np.random.normal(26.0, 1.5)
+            do = np.random.normal(6.5, 0.5)
+            salinity = np.random.normal(15.0, 2.0)
+            ammonia = np.random.exponential(0.02)
+            turbidity = np.random.normal(12.0, 3.0)
+        else:
+            ph = np.random.normal(6.1, 0.6)
+            temp = np.random.normal(31.0, 2.5)
+            do = np.random.normal(3.2, 0.8)
+            salinity = np.random.normal(28.0, 4.0)
+            ammonia = np.random.exponential(0.25)
+            turbidity = np.random.normal(45.0, 10.0)
+
+        # Inject controlled label noise
+        if np.random.rand() < noise_rate:
+            ph += np.random.normal(0, 1.0)
+            do += np.random.normal(0, 1.5)
+
+        records.append({
+            "image_path": row["image_path"],
+            "label": row["label"],
+            "split": row["split"],
+            "ph": round(float(np.clip(ph, 4.0, 10.0)), 2),
+            "temperature": round(float(np.clip(temp, 15.0, 40.0)), 2),
+            "dissolved_oxygen": round(float(np.clip(do, 0.5, 12.0)), 2),
+            "salinity": round(float(np.clip(salinity, 0.0, 40.0)), 2),
+            "ammonia": round(float(np.clip(ammonia, 0.0, 3.0)), 3),
+            "turbidity": round(float(np.clip(turbidity, 1.0, 100.0)), 2),
+        })
+
+    return pd.DataFrame(records)
+
+
+def train_tabular_model(df: pd.DataFrame, out_dir: Path):
+    features = ["ph", "temperature", "dissolved_oxygen", "salinity", "ammonia", "turbidity"]
+    X = df[features]
+    y = df["label"]
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+    clf = RandomForestClassifier(n_estimators=100, random_state=42)
+    clf.fit(X_train, y_train)
+
+    preds = clf.predict(X_test)
+    report = classification_report(y_test, preds, output_dict=True)
+    
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(report).transpose().to_csv(out_dir / "tabular_classification_report.csv")
+    
+    # Feature Importances
+    df_imp = pd.DataFrame({"feature": features, "importance": clf.feature_importances_})
+    df_imp.to_csv(out_dir / "feature_importances.csv", index=False)
+
+    return clf, report
+
+
+def run(config):
+    manifest_dir = config.paths.datasets / "manifests"
+    wq_out_dir = config.paths.datasets / "water_quality"
+    wq_out_dir.mkdir(parents=True, exist_ok=True)
+    
+    out_dir = config.paths.outputs / "water_quality"
+
+    fish_manifest = manifest_dir / "fish_manifest_deduped.csv"
+    if fish_manifest.exists():
+        df_fish = pd.read_csv(fish_manifest)
+        df_fish_wq = generate_synthetic_water_data(df_fish, noise_rate=config.water_quality.label_noise_rate)
+        fish_wq_path = wq_out_dir / "fish_water_quality.csv"
+        df_fish_wq.to_csv(fish_wq_path, index=False)
+        _, report = train_tabular_model(df_fish_wq, out_dir / "fish")
+        print(f"Fish Water Quality Dataset created ({len(df_fish_wq)} rows). Macro F1: {report['macro avg']['f1-score']:.4f}")
+
+    shrimp_manifest = manifest_dir / "shrimp_manifest_deduped.csv"
+    if shrimp_manifest.exists():
+        df_shrimp = pd.read_csv(shrimp_manifest)
+        df_shrimp_wq = generate_synthetic_water_data(df_shrimp, noise_rate=config.water_quality.label_noise_rate)
+        shrimp_wq_path = wq_out_dir / "shrimp_water_quality.csv"
+        df_shrimp_wq.to_csv(shrimp_wq_path, index=False)
+        _, report = train_tabular_model(df_shrimp_wq, out_dir / "shrimp")
+        print(f"Shrimp Water Quality Dataset created ({len(df_shrimp_wq)} rows). Macro F1: {report['macro avg']['f1-score']:.4f}")
+
+
+if __name__ == "__main__":
+    from config import load_config
+    cfg = load_config()
+    run(cfg)
+
+
+
+=== __init__.py ===
+
+
+
+=== analytics.py ===
+import pandas as pd
+import numpy as np
+import json
+from pathlib import Path
+from typing import Dict, Any
+
+class DeveloperAnalyticsEngine:
+    def __init__(self, base_dir: str = "."):
+        self.base_dir = Path(base_dir)
+        self.processed_dir = self.base_dir / "datasets" / "processed"
+        self.checkpoints_dir = self.base_dir / "checkpoints"
+        self.exports_dir = self.base_dir / "exports"
+        self.bfri_path = self.base_dir / "datasets" / "bfri_docs" / "bfri_guidelines.json"
+
+    def get_manifest_stats(self, species: str) -> Dict[str, Any]:
+        manifest_path = self.processed_dir / f"{species}_processed_manifest.csv"
+        if not manifest_path.exists():
+            return {"status": "missing", "message": f"Manifest not found at {manifest_path}"}
+
+        df = pd.read_csv(manifest_path)
+
+        total_images = len(df)
+        heldout_test_count = int((df["fold"] == -1).sum()) if "fold" in df.columns else 0
+        cv_train_val_count = total_images - heldout_test_count
+        augmented_count = int(df["is_augmented"].sum()) if "is_augmented" in df.columns else 0
+
+        fold_counts = df["fold"].value_counts().to_dict() if "fold" in df.columns else {}
+        class_counts = df["label"].value_counts().to_dict()
+
+        tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in df.columns]
+        wq_summary = {}
+        for col in tab_cols:
+            valid_series = df[col].dropna()
+            if not valid_series.empty:
+                wq_summary[col] = {
+                    "mean": round(float(valid_series.mean()), 3),
+                    "min": round(float(valid_series.min()), 3),
+                    "max": round(float(valid_series.max()), 3),
+                    "missing_count": int(df[col].isna().sum())
+                }
+
+        return {
+            "status": "active",
+            "total_images": total_images,
+            "cv_pool_size": cv_train_val_count,
+            "heldout_test_size": heldout_test_count,
+            "augmented_samples": augmented_count,
+            "fold_distribution": {f"fold_{k}": v for k, v in fold_counts.items()},
+            "class_distribution": class_counts,
+            "water_quality_analytics": wq_summary
+        }
+
+    def get_system_summary(self) -> Dict[str, Any]:
+        fish_stats = self.get_manifest_stats("fish")
+        shrimp_stats = self.get_manifest_stats("shrimp")
+
+        pt_files = [f.name for f in self.checkpoints_dir.glob("*.pt")] if self.checkpoints_dir.exists() else []
+        scaler_files = [f.name for f in self.checkpoints_dir.glob("*.pkl")] if self.checkpoints_dir.exists() else []
+        onnx_files = [f.name for f in self.exports_dir.glob("*.onnx")] if self.exports_dir.exists() else []
+
+        bfri_count = 0
+        if self.bfri_path.exists():
+            with open(self.bfri_path, "r", encoding="utf-8-sig") as f:
+                bfri_docs = json.load(f)
+                bfri_count = len(bfri_docs)
+
+        return {
+            "dataset_summary": {
+                "fish": fish_stats,
+                "shrimp": shrimp_stats
+            },
+            "system_artifacts": {
+                "pytorch_checkpoints": pt_files,
+                "scaler_files": scaler_files,
+                "onnx_models": onnx_files,
+                "bfri_protocols_count": bfri_count
+            }
+        }
+
+
+
+=== main.py ===
+import json
+import cv2
+import numpy as np
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse, HTMLResponse
+from aquavision.api.admin.router import admin_router
+from aquavision.engine.predictor import AquaPredictor
+
+app = FastAPI(
+    title="AquaVision BD Diagnostic API Engine",
+    description="Multimodal Aquatic Disease Diagnostic API and Research Hub",
+    version="2.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(admin_router)
+
+# In-memory cache to prevent reloading heavy PyTorch weights on every API call
+_model_cache = {}
+
+def get_cached_predictor(species: str):
+    if species not in _model_cache:
+        try:
+            _model_cache[species] = AquaPredictor(species=species, fold=0)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Model initialization failed: {str(e)}")
+    return _model_cache[species]
+
+@app.get("/")
+def redirect_to_dashboard():
+    return RedirectResponse(url="/admin/dashboard")
+
+@app.get("/health")
+def health_check():
+    return {"status": "online", "system": "AquaVision Engine v2"}
+
+@app.post("/predict-multimodal")
+async def process_multimodal_prediction(
+    file: UploadFile = File(...),
+    species: str = Form("fish"),
+    water_quality: str = Form("{}")
+):
+    try:
+        wq_dict = json.loads(water_quality)
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if img is None:
+            raise HTTPException(status_code=400, detail="Could not decode image.")
+            
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        predictor = get_cached_predictor(species)
+        results = predictor.predict(img_rgb, wq_dict)
+        return results
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/test", tags=["Testing UI"])
+def serve_rich_testing_ui():
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>AquaVision Multimodal Engine</title>
+        <style>
+            :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --accent: #38bdf8; --border: #334155; --success: #10b981; }
+            body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 2rem; margin: 0; }
+            .container { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+            .card { background: var(--card); border: 1px solid var(--border); border-radius: 1rem; padding: 2rem; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.5); }
+            h1, h2 { color: var(--accent); margin-top: 0; }
+            .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
+            label { display: block; font-size: 0.875rem; color: #94a3b8; margin-bottom: 0.5rem; }
+            input, select { width: 100%; padding: 0.75rem; border-radius: 0.5rem; border: 1px solid var(--border); background: var(--bg); color: var(--text); box-sizing: border-box; }
+            button { width: 100%; padding: 1rem; background: var(--accent); color: #000; border: none; border-radius: 0.5rem; font-weight: bold; font-size: 1rem; cursor: pointer; margin-top: 1rem; }
+            button:hover { opacity: 0.9; }
+            #preview { max-width: 100%; border-radius: 0.5rem; display: none; margin-top: 1rem; border: 1px solid var(--border); }
+            
+            /* Results Panel Styling */
+            .main-result { background: rgba(56, 189, 248, 0.1); border: 1px solid var(--accent); padding: 1.5rem; border-radius: 0.5rem; text-align: center; margin-bottom: 2rem; display: none; }
+            .main-result h2 { margin: 0; font-size: 2rem; color: var(--text); }
+            .main-result span { color: var(--accent); font-weight: bold; font-size: 1.25rem; }
+            .prob-item { margin-bottom: 1rem; }
+            .prob-header { display: flex; justify-content: space-between; font-size: 0.875rem; margin-bottom: 0.25rem; }
+            .prob-track { background: var(--bg); height: 8px; border-radius: 4px; overflow: hidden; }
+            .prob-fill { background: var(--success); height: 100%; width: 0%; transition: width 0.6s ease-out; }
+            #error-box { color: #ef4444; margin-top: 1rem; display: none; }
+        </style>
+    </head>
+    <body>
+        <h1 style="text-align: center; margin-bottom: 2rem;">🔬 AquaVision Multimodal Diagnostic Hub</h1>
+        <div class="container">
+            
+            <!-- Left Panel: Data Inputs -->
+            <div class="card">
+                <h2>1. Input Parameters</h2>
+                <form id="engineForm">
+                    <label>Target Species</label>
+                    <select id="species" style="margin-bottom: 1rem;">
+                        <option value="fish">Fish</option>
+                        <option value="shrimp">Shrimp</option>
+                    </select>
+                    
+                    <h3 style="color: #94a3b8; font-size: 1rem; border-bottom: 1px solid #334155; padding-bottom: 0.5rem;">Water Quality Data</h3>
+                    <div class="form-grid">
+                        <div><label>Temperature (°C)</label><input type="number" id="temp" step="0.1" value="25.0"></div>
+                        <div><label>pH Level</label><input type="number" id="ph" step="0.1" value="7.5"></div>
+                        <div><label>Dissolved Oxygen (mg/L)</label><input type="number" id="do" step="0.1" value="6.0"></div>
+                        <div><label>Ammonia (mg/L)</label><input type="number" id="nh3" step="0.01" value="0.01"></div>
+                    </div>
+
+                    <h3 style="color: #94a3b8; font-size: 1rem; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; margin-top: 1.5rem;">Visual Subject</h3>
+                    <input type="file" id="file" accept="image/*" required onchange="previewImage(event)">
+                    <img id="preview" alt="Image preview">
+
+                    <button type="submit" id="submitBtn">Run Diagnostic Inference</button>
+                    <div id="error-box"></div>
+                </form>
+            </div>
+
+            <!-- Right Panel: Inference Results -->
+            <div class="card">
+                <h2>2. Diagnostic Report</h2>
+                <p id="placeholder" style="color: #94a3b8;">Awaiting data input...</p>
+                
+                <div class="main-result" id="mainResultBox">
+                    <h2 id="topPrediction">--</h2>
+                    <span id="topConfidence">--% Confidence</span>
+                </div>
+
+                <div id="probBreakdown"></div>
+            </div>
+        </div>
+
+        <script>
+            function previewImage(event) {
+                const reader = new FileReader();
+                reader.onload = function(){
+                    const output = document.getElementById('preview');
+                    output.src = reader.result;
+                    output.style.display = 'block';
+                };
+                reader.readAsDataURL(event.target.files[0]);
+            }
+
+            document.getElementById('engineForm').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const btn = document.getElementById('submitBtn');
+                const errBox = document.getElementById('error-box');
+                btn.textContent = 'Running Inference...';
+                btn.disabled = true;
+                errBox.style.display = 'none';
+
+                const formData = new FormData();
+                formData.append('file', document.getElementById('file').files[0]);
+                formData.append('species', document.getElementById('species').value);
+                
+                const wq = {
+                    temperature: parseFloat(document.getElementById('temp').value),
+                    ph: parseFloat(document.getElementById('ph').value),
+                    dissolved_oxygen: parseFloat(document.getElementById('do').value),
+                    ammonia: parseFloat(document.getElementById('nh3').value)
+                };
+                formData.append('water_quality', JSON.stringify(wq));
+
+                try {
+                    const res = await fetch('/predict-multimodal', { method: 'POST', body: formData });
+                    const data = await res.json();
+                    
+                    if (res.ok) {
+                        document.getElementById('placeholder').style.display = 'none';
+                        document.getElementById('mainResultBox').style.display = 'block';
+                        
+                        document.getElementById('topPrediction').textContent = data.prediction;
+                        document.getElementById('topConfidence').textContent = (data.confidence * 100).toFixed(1) + '% Confidence';
+
+                        const breakdown = document.getElementById('probBreakdown');
+                        breakdown.innerHTML = '<h3 style="margin-bottom: 1rem;">Probability Breakdown</h3>';
+                        
+                        // Sort probabilities descending
+                        const sortedProbs = Object.entries(data.all_probabilities).sort((a, b) => b[1] - a[1]);
+                        
+                        sortedProbs.forEach(([cls, prob]) => {
+                            const pct = (prob * 100).toFixed(1);
+                            breakdown.innerHTML += `
+                                <div class="prob-item">
+                                    <div class="prob-header"><span>${cls}</span><span>${pct}%</span></div>
+                                    <div class="prob-track"><div class="prob-fill" style="width: ${pct}%"></div></div>
+                                </div>
+                            `;
+                        });
+                    } else {
+                        errBox.textContent = data.detail || 'Prediction failed.';
+                        errBox.style.display = 'block';
+                    }
+                } catch (err) {
+                    errBox.textContent = 'Network or server error.';
+                    errBox.style.display = 'block';
+                } finally {
+                    btn.textContent = 'Run Diagnostic Inference';
+                    btn.disabled = false;
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+
+
+=== __init__.py ===
+
+
+
+=== engine.py ===
+import pandas as pd
+from pathlib import Path
+from typing import Dict, Any, List
+
+class DynamicAnalyticsEngine:
+    def __init__(self):
+        # Strictly use the terminal's working directory
+        self.base_dir = Path.cwd()
+        self.processed_dir = self.base_dir / "datasets" / "processed"
+        self.checkpoints_dir = self.base_dir / "checkpoints"
+        self.exports_dir = self.base_dir / "exports"
+        
+        # Debug outputs to your terminal
+        print(f"\n[SYSTEM] Looking for datasets in: {self.processed_dir}")
+        print(f"[SYSTEM] Directory exists? {self.processed_dir.exists()}")
+
+    def get_available_datasets(self) -> List[str]:
+        if not self.processed_dir.exists():
+            return []
+        
+        datasets = []
+        # Find all CSV files in the directory
+        for file in self.processed_dir.glob("*.csv"):
+            if "processed_manifest" in file.name:
+                name = file.name.replace("_processed_manifest.csv", "")
+                datasets.append(name)
+                
+        print(f"[SYSTEM] Found datasets: {datasets}\n")
+        return sorted(datasets)
+
+    def get_dataset_metrics(self) -> Dict[str, Any]:
+        datasets = self.get_available_datasets()
+        metrics = {}
+        total_global_samples = 0
+        total_global_heldout = 0
+
+        for ds in datasets:
+            manifest_path = self.processed_dir / f"{ds}_processed_manifest.csv"
+            df = pd.read_csv(manifest_path)
+            
+            total = len(df)
+            total_global_samples += total
+            
+            heldout = int((df["fold"] == -1).sum()) if "fold" in df.columns else 0
+            total_global_heldout += heldout
+            
+            augmented = int(df.get("is_augmented", pd.Series([0])).sum()) if "is_augmented" in df.columns else 0
+            
+            fold_dist = {}
+            if "fold" in df.columns:
+                for f in sorted(df["fold"].unique()):
+                    f_df = df[df["fold"] == f]
+                    fold_dist[f"Fold {f}"] = {
+                        "original": int((f_df.get("is_augmented", 0) == 0).sum()),
+                        "augmented": int((f_df.get("is_augmented", 0) == 1).sum())
+                    }
+                    
+            # Fallback if label column is missing
+            label_col = "label" if "label" in df.columns else df.columns[1] 
+            
+            metrics[ds] = {
+                "total": total,
+                "heldout": heldout,
+                "cv_pool": total - heldout,
+                "augmented_ratio": round(augmented / total * 100, 1) if total > 0 else 0,
+                "class_balance": df[label_col].value_counts().to_dict(),
+                "fold_breakdown": fold_dist
+            }
+            
+        return {
+            "datasets": metrics,
+            "global_stats": {
+                "total_samples": total_global_samples,
+                "total_heldout": total_global_heldout,
+                "dataset_count": len(datasets)
+            }
+        }
+
+    def get_model_metrics(self) -> Dict[str, Any]:
+        artifacts = {"pytorch_checkpoints": {}, "onnx_exports": {}}
+        
+        if self.checkpoints_dir.exists():
+            for pt in self.checkpoints_dir.glob("*.pt"):
+                arch = pt.stem.split("_")[0] if "_" in pt.stem else "custom_model"
+                if arch not in artifacts["pytorch_checkpoints"]:
+                    artifacts["pytorch_checkpoints"][arch] = []
+                artifacts["pytorch_checkpoints"][arch].append(pt.name)
+                
+        if self.exports_dir.exists():
+            for onnx_file in self.exports_dir.glob("*.onnx"):
+                arch = onnx_file.stem.split("_")[0] if "_" in onnx_file.stem else "custom_model"
+                if arch not in artifacts["onnx_exports"]:
+                    artifacts["onnx_exports"][arch] = []
+                artifacts["onnx_exports"][arch].append(onnx_file.name)
+                
+        return artifacts
+
+
+
+=== router.py ===
+import json
+from fastapi import APIRouter
+from fastapi.responses import HTMLResponse
+from aquavision.api.admin.engine import DynamicAnalyticsEngine
+from aquavision.api.admin.views import get_dashboard_html
+
+admin_router = APIRouter(prefix="/admin", tags=["Research Dashboard"])
+engine = DynamicAnalyticsEngine()
+
+@admin_router.get("/dashboard", response_class=HTMLResponse)
+def render_research_dashboard():
+    # No longer injecting a string; letting the frontend fetch the data securely
+    return get_dashboard_html()
+
+@admin_router.get("/api/metrics")
+def get_metrics_api():
+    # New endpoint serving raw JSON data
+    return {
+        "dataset_metrics": engine.get_dataset_metrics(),
+        "model_metrics": engine.get_model_metrics()
+    }
+
+
+=== views.py ===
+def get_dashboard_html() -> str:
+    return """
+    <!DOCTYPE html>
+    <html lang="en" class="dark">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>AquaVision BD — Computer Vision Research Hub</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+        <script>
+            tailwind.config = { darkMode: 'class', theme: { extend: { colors: { brand: '#0ea5e9', darkbg: '#0f172a', cardbg: '#1e293b' } } } }
+        </script>
+    </head>
+    <body class="bg-darkbg text-slate-200 font-sans min-h-screen p-4 md:p-8">
+        <div class="max-w-7xl mx-auto space-y-8">
+
+            <div class="border-b border-slate-700 pb-6">
+                <h1 class="text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-brand to-emerald-400 tracking-tight">
+                    AquaVision Image Analytics Hub
+                </h1>
+                <p class="text-slate-400 mt-2 font-medium">Dynamic Dataset Detection & Model Artifact Tracking</p>
+            </div>
+
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div class="bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                    <p class="text-xs font-bold text-slate-400 uppercase tracking-wider">Total Datasets</p>
+                    <h2 id="kpi-datasets" class="text-4xl font-black text-white mt-2">0</h2>
+                </div>
+                <div class="bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                    <p class="text-xs font-bold text-slate-400 uppercase tracking-wider">Total Image Samples</p>
+                    <h2 id="kpi-total" class="text-4xl font-black text-brand mt-2">0</h2>
+                </div>
+                <div class="bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                    <p class="text-xs font-bold text-slate-400 uppercase tracking-wider">Zero-Leakage Held-out</p>
+                    <h2 id="kpi-heldout" class="text-4xl font-black text-purple-400 mt-2">0</h2>
+                </div>
+                <div class="bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                    <p class="text-xs font-bold text-slate-400 uppercase tracking-wider">Architectures Tracked</p>
+                    <h2 id="kpi-models" class="text-4xl font-black text-emerald-400 mt-2">0</h2>
+                </div>
+            </div>
+
+            <div id="dynamic-datasets"></div>
+
+            <div class="bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                <h3 class="text-xl font-bold text-white mb-6"><i class="fas fa-microchip text-emerald-400 mr-2"></i>Compiled Model Artifacts</h3>
+                <div id="dynamic-models" class="overflow-x-auto"></div>
+            </div>
+
+        </div>
+
+        <script>
+            async function fetchMetrics() {
+                try {
+                    const response = await fetch('/admin/api/metrics');
+                    const DATA = await response.json();
+
+                    document.getElementById('kpi-datasets').innerText = DATA.dataset_metrics.global_stats.dataset_count;
+                    document.getElementById('kpi-total').innerText = DATA.dataset_metrics.global_stats.total_samples.toLocaleString();
+                    document.getElementById('kpi-heldout').innerText = DATA.dataset_metrics.global_stats.total_heldout.toLocaleString();
+
+                    const modelsCount = Object.keys(DATA.model_metrics.pytorch_checkpoints).length;
+                    document.getElementById('kpi-models').innerText = modelsCount;
+
+                    const container = document.getElementById('dynamic-datasets');
+                    let html = '';
+
+                    for (const [dsName, stats] of Object.entries(DATA.dataset_metrics.datasets)) {
+                        const title = dsName.charAt(0).toUpperCase() + dsName.slice(1);
+                        html += `
+                        <div class="mb-8 bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                            <div class="flex justify-between items-center mb-6 border-b border-slate-700 pb-4">
+                                <h3 class="text-2xl font-bold text-white"><i class="fas fa-folder-open text-brand mr-2"></i>Dataset: ${title}</h3>
+                                <span class="px-3 py-1 bg-slate-800 rounded-lg text-sm font-bold text-slate-300">Total Samples: ${stats.total.toLocaleString()}</span>
+                            </div>
+                            <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                                <div>
+                                    <h4 class="text-sm font-bold text-slate-400 mb-4 text-center">Class Distribution</h4>
+                                    <div class="h-64"><canvas id="classChart-${dsName}"></canvas></div>
+                                </div>
+                                <div>
+                                    <h4 class="text-sm font-bold text-slate-400 mb-4 text-center">Stratified Folds (Orig vs Aug)</h4>
+                                    <div class="h-64"><canvas id="foldChart-${dsName}"></canvas></div>
+                                </div>
+                            </div>
+                        </div>`;
+                    }
+                    container.innerHTML = html;
+
+                    for (const [dsName, stats] of Object.entries(DATA.dataset_metrics.datasets)) {
+                        new Chart(document.getElementById(`classChart-${dsName}`).getContext('2d'), {
+                            type: 'doughnut',
+                            data: {
+                                labels: Object.keys(stats.class_balance),
+                                datasets: [{ data: Object.values(stats.class_balance), backgroundColor: ['#0ea5e9','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#14b8a6','#f97316'], borderWidth: 0 }]
+                            },
+                            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right', labels: { color: '#cbd5e1' } } }, cutout: '70%' }
+                        });
+
+                        const foldLabels = Object.keys(stats.fold_breakdown);
+                        const originals = foldLabels.map(l => stats.fold_breakdown[l].original);
+                        const augs = foldLabels.map(l => stats.fold_breakdown[l].augmented);
+
+                        new Chart(document.getElementById(`foldChart-${dsName}`).getContext('2d'), {
+                            type: 'bar',
+                            data: {
+                                labels: foldLabels,
+                                datasets: [
+                                    { label: 'Original', data: originals, backgroundColor: '#0ea5e9' },
+                                    { label: 'Augmented', data: augs, backgroundColor: '#8b5cf6' }
+                                ]
+                            },
+                            options: { responsive: true, maintainAspectRatio: false, scales: { x: { stacked: true }, y: { stacked: true } }, plugins: { legend: { labels: { color: '#cbd5e1' } } } }
+                        });
+                    }
+
+                    const modelContainer = document.getElementById('dynamic-models');
+                    const ptModels = DATA.model_metrics.pytorch_checkpoints;
+                    const onnxModels = DATA.model_metrics.onnx_exports;
+
+                    let modelHtml = '<table class="w-full text-left border-collapse"><thead class="border-b border-slate-700"><tr><th class="py-3 px-4 text-slate-400 uppercase text-xs">Model Architecture</th><th class="py-3 px-4 text-slate-400 uppercase text-xs">PyTorch Assets (.pt)</th><th class="py-3 px-4 text-slate-400 uppercase text-xs">Edge Assets (.onnx)</th></tr></thead><tbody>';
+
+                    const allArchs = new Set([...Object.keys(ptModels), ...Object.keys(onnxModels)]);
+                    for (const arch of allArchs) {
+                        const ptCount = ptModels[arch] ? ptModels[arch].length : 0;
+                        const onnxCount = onnxModels[arch] ? onnxModels[arch].length : 0;
+                        modelHtml += `<tr class="border-b border-slate-800 hover:bg-slate-800/50">
+                            <td class="py-4 px-4 font-bold text-brand uppercase">${arch}</td>
+                            <td class="py-4 px-4"><span class="px-3 py-1 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded">${ptCount} Checkpoints</span></td>
+                            <td class="py-4 px-4"><span class="px-3 py-1 ${onnxCount > 0 ? 'bg-orange-500/10 text-orange-400 border border-orange-500/20' : 'bg-slate-800 text-slate-500'} rounded">${onnxCount} Exports</span></td>
+                        </tr>`;
+                    }
+                    modelHtml += '</tbody></table>';
+
+                    if(allArchs.size === 0) {
+                        modelContainer.innerHTML = '<p class="text-slate-500 italic text-center py-6">No model architectures detected in /checkpoints.</p>';
+                    } else {
+                        modelContainer.innerHTML = modelHtml;
+                    }
+                } catch (error) {
+                    console.error("Error loading dashboard data:", error);
+                }
+            }
+            window.onload = fetchMetrics;
+        </script>
+    </body>
+    </html>
+    """
+
+
+=== __init__.py ===
+
+
+
+=== preprocess.py ===
+import os
+import pandas as pd
+from pathlib import Path
+from sklearn.model_selection import StratifiedKFold, train_test_split
+
+def preprocess_datasets():
+    base_path = Path(__file__).resolve().parents[2]
+    datasets_dir = base_path / "datasets"
+    processed_dir = datasets_dir / "processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    # Exclude system folders
+    ignored_folders = {"processed", "manifests", "bfri_docs", "eda_outputs", "__pycache__"}
+    
+    species_folders = [
+        f for f in datasets_dir.iterdir() 
+        if f.is_dir() and f.name not in ignored_folders and not f.name.startswith(".")
+    ]
+    
+    if not species_folders:
+        print(f"\n[ERROR] No raw dataset folders found inside {datasets_dir}")
+        return
+
+    for species_dir in species_folders:
+        species_name = species_dir.name
+        print(f"\n--- Processing Dataset: {species_name.upper()} ---")
+        
+        data = []
+        class_folders = [f for f in species_dir.iterdir() if f.is_dir()]
+        
+        for class_folder in class_folders:
+            class_name = class_folder.name
+            images = []
+            for ext in ["*.jpg", "*.jpeg", "*.png", "*.JPG", "*.PNG"]:
+                images.extend(list(class_folder.glob(ext)))
+                
+            for img_path in images:
+                data.append({
+                    "image_path": str(img_path.relative_to(base_path)).replace("\\", "/"),
+                    "label": class_name,
+                    "is_augmented": 0
+                })
+                
+        if not data:
+            print(f"  -> No images found for {species_name}. Skipping.")
+            continue
+            
+        df = pd.DataFrame(data)
+        print(f"  -> Found {len(df)} images across {df['label'].nunique()} classes.")
+        
+        df['fold'] = -1
+        try:
+            train_idx, test_idx = train_test_split(
+                df.index, test_size=0.1, random_state=42, stratify=df['label']
+            )
+            df.loc[test_idx, 'fold'] = -1
+            
+            train_df = df.loc[train_idx].copy()
+            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            
+            for fold, (_, val_idx) in enumerate(skf.split(train_df, train_df['label'])):
+                actual_val_idx = train_df.iloc[val_idx].index
+                df.loc[actual_val_idx, 'fold'] = fold
+                
+        except ValueError:
+            print(f"  -> Defaulting to simple fold assignment.")
+            df['fold'] = df.index % 5
+            
+        out_path = processed_dir / f"{species_name}_processed_manifest.csv"
+        df.to_csv(out_path, index=False)
+        print(f"  -> Success! Generated manifest: {out_path}")
+
+if __name__ == "__main__":
+    preprocess_datasets()
+
+
+
+=== __init__.py ===
+
+
+
+=== predictor.py ===
+import torch
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import joblib
+import cv2
+from pathlib import Path
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+from aquavision.preprocessing import letterbox_resize
+from aquavision.fusion import AquaVisionMultimodalModel
+
+class AquaPredictor:
+    def __init__(self, species: str = "fish", fold: int = 0):
+        self.species = species
+        self.fold = fold
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        manifest_path = Path("datasets/processed") / f"{species}_processed_manifest.csv"
+        df = pd.read_csv(manifest_path)
+        self.classes = sorted(df["label"].unique())
+        self.tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in df.columns]
+
+        scaler_path = Path("checkpoints") / f"{species}_scaler_fold{fold}.pkl"
+        self.scaler = joblib.load(scaler_path) if scaler_path.exists() else None
+
+        checkpoint_path = Path("checkpoints") / f"{species}_best_model_fold{fold}.pt"
+        self.model = AquaVisionMultimodalModel(num_classes=len(self.classes), num_tabular_features=len(self.tab_cols), backbone_name="resnet18").to(self.device)
+        self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device, weights_only=True))
+        self.model.eval()
+
+        self.transform = A.Compose([
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+
+    def predict(self, image_input, water_quality_dict: dict = None):
+        if isinstance(image_input, str):
+            img = cv2.imread(image_input)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        else:
+            img = image_input
+
+        img_resized = letterbox_resize(img, target_size=224, species=self.species)
+        img_tensor = self.transform(image=img_resized)["image"].unsqueeze(0).to(self.device)
+
+        if self.tab_cols and water_quality_dict:
+            wq = water_quality_dict.copy()
+            wq["temp_do_ratio"] = wq.get("temperature", 25.0) / (wq.get("dissolved_oxygen", 6.0) + 1e-5)
+            wq["ammonia_toxicity_index"] = wq.get("ammonia", 0.01) * (10 ** (wq.get("ph", 7.5) - 7.0)) * (wq.get("temperature", 25.0) / 25.0)
+            wq["stress_score"] = (abs(wq.get("ph", 7.5) - 7.5) * 0.3) + (wq.get("ammonia", 0.01) * 10.0 * 0.4) + (max(0, 6.0 - wq.get("dissolved_oxygen", 6.0)) * 0.3)
+
+            raw_df = pd.DataFrame([[wq[c] for c in self.tab_cols]], columns=self.tab_cols)
+            scaled_vector = self.scaler.transform(raw_df)[0] if self.scaler else raw_df.values[0]
+            tab_tensor = torch.tensor(scaled_vector, dtype=torch.float32).unsqueeze(0).to(self.device)
+            logits = self.model(img_tensor, tab_tensor)
+        else:
+            logits = self.model(img_tensor)
+
+        probs = F.softmax(logits, dim=1).squeeze().cpu().detach().numpy()
+        top_idx = int(np.argmax(probs))
+        return {
+            "prediction": self.classes[top_idx],
+            "confidence": float(probs[top_idx]),
+            "all_probabilities": {cls: float(p) for cls, p in zip(self.classes, probs)}
+        }
+
+
+
+=== vision_backbone.py ===
+import torch
+import torch.nn as nn
+import torchvision.models as models
+
+class AquaVisionModel(nn.Module):
+    def __init__(self, num_classes: int, backbone: str = 'efficientnet_b0', pretrained: bool = True):
+        super(AquaVisionModel, self).__init__()
+        
+        # Initialize the chosen vision backbone
+        if backbone == 'efficientnet_b0':
+            weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
+            self.backbone = models.efficientnet_b0(weights=weights)
+            in_features = self.backbone.classifier[1].in_features
+            
+            # Replace the classifier head for our specific disease classes
+            self.backbone.classifier[1] = nn.Sequential(
+                nn.Dropout(p=0.3, inplace=True),
+                nn.Linear(in_features, num_classes)
+            )
+            
+        elif backbone == 'resnet50':
+            weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+            self.backbone = models.resnet50(weights=weights)
+            in_features = self.backbone.fc.in_features
+            
+            # Replace the fully connected layer
+            self.backbone.fc = nn.Linear(in_features, num_classes)
+            
+        else:
+            raise ValueError(f"Unsupported backbone: {backbone}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Strictly image tensor in, logits out. No tabular routing.
+        return self.backbone(x)
+
+
+
+=== __init__.py ===
+
+
+
+=== bfri_rag.py ===
+import json
+from pathlib import Path
+from typing import Dict, Any
+
+class BFRIRagEngine:
+    def __init__(self, doc_path: str = "datasets/bfri_docs/bfri_guidelines.json"):
+        self.doc_path = Path(doc_path)
+        self.knowledge_base = self._load_docs()
+
+    def _load_docs(self) -> Dict[str, Any]:
+        if not self.doc_path.exists():
+            return {}
+        # Fixed: utf-8-sig strips Windows PowerShell BOM headers automatically
+        with open(self.doc_path, "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+
+    def retrieve_treatment(self, disease_name: str) -> Dict[str, Any]:
+        treatment = self.knowledge_base.get(disease_name)
+        if treatment:
+            return {
+                "found": True,
+                "disease": disease_name,
+                "protocol": treatment
+            }
+        return {
+            "found": False,
+            "disease": disease_name,
+            "protocol": {
+                "symptoms": "General aquatic stress symptoms detected.",
+                "bfri_treatment": "Consult local BFRI extension officer or district fisheries officer.",
+                "water_remediation": "Perform partial water exchange and test pH, DO, and ammonia."
+            }
+        }
+
+if __name__ == "__main__":
+    rag = BFRIRagEngine()
+    res = rag.retrieve_treatment("EUS")
+    print("\n--- BFRI RAG Query Result (EUS) ---")
+    print(json.dumps(res, indent=2))
+
+
+
+=== __init__.py ===
+
