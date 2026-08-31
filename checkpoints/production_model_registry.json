@@ -1,0 +1,10 @@
+{
+  "fish": {
+    "backbone_name": "resnet18",
+    "fold": 0
+  },
+  "shrimp": {
+    "backbone_name": "resnet18",
+    "fold": 0
+  }
+}

@@ -1,137 +1,198 @@
-﻿import torch
+﻿import os
+import argparse
+import joblib
+import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
-import joblib
+import cv2
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, f1_score
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
-from aquavision.dataset import AquaDataset
+from aquavision.preprocessing import letterbox_resize
 from aquavision.fusion import AquaVisionMultimodalModel
+from config import load_config
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device):
-    model.train()
-    total_loss = 0.0
-    for batch in dataloader:
-        optimizer.zero_grad()
-        if len(batch) == 3:
-            images, tabular, labels = batch
-            images, tabular, labels = images.to(device), tabular.to(device), labels.to(device)
-            outputs = model(images, tabular)
+
+class AquaMultimodalDataset(Dataset):
+    def __init__(self, df, img_dir, tab_cols=None, transform=None, species="fish"):
+        self.df = df.reset_index(drop=True)
+        self.img_dir = Path(img_dir)
+        self.tab_cols = tab_cols or []
+        self.transform = transform
+        self.species = species
+        
+        # Maps string labels to integer indices
+        self.label_map = {lbl: idx for idx, lbl in enumerate(sorted(self.df["label"].unique()))}
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_path = self.img_dir / row["image_path"]
+        
+        img = cv2.imread(str(img_path))
+        if img is None:
+            img = np.zeros((224, 224, 3), dtype=np.uint8)
         else:
-            images, labels = batch
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * images.size(0)
-    return total_loss / len(dataloader.dataset)
+        img_resized = letterbox_resize(img, target_size=224, species=self.species)
 
-def evaluate(model, dataloader, device):
-    model.eval()
-    all_preds, all_labels = [], []
-    with torch.no_grad():
-        for batch in dataloader:
-            if len(batch) == 3:
-                images, tabular, labels = batch
-                images, tabular = images.to(device), tabular.to(device)
-                outputs = model(images, tabular)
-            else:
-                images, labels = batch
-                images = images.to(device)
-                outputs = model(images)
+        if self.transform:
+            augmented = self.transform(image=img_resized)
+            img_tensor = augmented["image"]
+        else:
+            img_tensor = ToTensorV2()(image=img_resized)["image"]
 
-            preds = torch.argmax(outputs, dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.numpy())
+        label_idx = self.label_map[row["label"]]
+        
+        if self.tab_cols:
+            tab_values = row[self.tab_cols].values.astype(np.float32)
+            return img_tensor, torch.tensor(tab_values, dtype=torch.float32), torch.tensor(label_idx, dtype=torch.long)
+        
+        return img_tensor, torch.tensor(label_idx, dtype=torch.long)
 
-    acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average="macro")
-    return acc, f1
 
-def run_cross_validation(species: str = "fish", epochs: int = 25, patience: int = 5, min_epochs: int = 10, batch_size: int = 16, lr: float = 3e-4):
+def train_cross_validation(species="fish", backbone_name="resnet18", epochs=5, batch_size=16, lr=1e-4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n--- Running 5-Fold Cross-Validation: {species.upper()} ---")
+    print(f"\n==================================================")
+    print(f" Starting Training: Species={species.upper()} | Backbone={backbone_name} | Device={device}")
+    print(f"==================================================")
 
-    manifest_path = Path("datasets/processed") / f"{species}_processed_manifest.csv"
+    processed_dir = Path("datasets/processed")
+    manifest_path = processed_dir / f"{species}_processed_manifest.csv"
+    
     if not manifest_path.exists():
-        print(f"Manifest missing for {species}")
-        return
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
     df = pd.read_csv(manifest_path)
+    img_dir = processed_dir / species
     
-    # Strictly isolate train/val data (exclude fold == -1)
-    cv_df = df[df["fold"] >= 0].copy().reset_index(drop=True)
+    tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in df.columns]
+    num_classes = len(df["label"].unique())
+    folds = sorted([f for f in df["fold"].unique() if f >= 0])
 
-    unique_labels = sorted(df["label"].unique())
-    label2idx = {lbl: idx for idx, lbl in enumerate(unique_labels)}
-    cv_df["label_idx"] = cv_df["label"].map(label2idx)
+    transform_train = A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.RandomBrightnessContrast(p=0.2),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2()
+    ])
 
-    tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in cv_df.columns]
+    transform_val = A.Compose([
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2()
+    ])
+
     checkpoints_dir = Path("checkpoints")
-    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir.mkdir(exist_ok=True)
 
-    fold_f1s = []
+    for fold in folds:
+        print(f"\n--- Fold {fold} ({species} - {backbone_name}) ---")
+        train_df = df[df["fold"] != fold].copy()
+        val_df = df[df["fold"] == fold].copy()
 
-    for fold in range(5):
-        train_df = cv_df[cv_df["fold"] != fold].copy()
-        val_df = cv_df[cv_df["fold"] == fold].copy()
-
+        # Fit scalar for tabular data per fold (backbone-agnostic filename)
+        scaler = None
         if tab_cols:
             scaler = StandardScaler()
-            train_df[tab_cols] = scaler.fit_transform(train_df[tab_cols].fillna(0.0))
-            val_df[tab_cols] = scaler.transform(val_df[tab_cols].fillna(0.0))
-            joblib.dump(scaler, checkpoints_dir / f"{species}_scaler_fold{fold}.pkl")
+            train_df[tab_cols] = scaler.fit_transform(train_df[tab_cols])
+            val_df[tab_cols] = scaler.transform(val_df[tab_cols])
+            
+            scaler_path = checkpoints_dir / f"{species}_scaler_fold{fold}.pkl"
+            joblib.dump(scaler, scaler_path)
 
-        train_ds = AquaDataset(train_df, is_train=True, species=species, tab_cols=tab_cols)
-        val_ds = AquaDataset(val_df, is_train=False, species=species, tab_cols=tab_cols)
+        train_ds = AquaMultimodalDataset(train_df, img_dir, tab_cols, transform=transform_train, species=species)
+        val_ds = AquaMultimodalDataset(val_df, img_dir, tab_cols, transform=transform_val, species=species)
 
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
         model = AquaVisionMultimodalModel(
-            num_classes=len(unique_labels),
+            num_classes=num_classes,
             num_tabular_features=len(tab_cols),
-            backbone_name="resnet18"
+            backbone_name=backbone_name,
+            pretrained=True
         ).to(device)
 
         criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
-        best_f1, best_acc = 0.0, 0.0
-        patience_counter = 0
-        best_checkpoint = checkpoints_dir / f"{species}_best_model_fold{fold}.pt"
+        best_val_acc = 0.0
+        # Dynamic backbone-aware checkpoint path
+        ckpt_path = checkpoints_dir / f"{species}_{backbone_name}_best_model_fold{fold}.pt"
 
         for epoch in range(epochs):
-            train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-            val_acc, val_f1 = evaluate(model, val_loader, device)
-            scheduler.step()
+            model.train()
+            train_loss, train_correct, train_total = 0.0, 0, 0
+            
+            for batch in train_loader:
+                if tab_cols:
+                    imgs, tabs, labels = batch
+                    imgs, tabs, labels = imgs.to(device), tabs.to(device), labels.to(device)
+                    outputs = model(imgs, tabs)
+                else:
+                    imgs, labels = batch
+                    imgs, labels = imgs.to(device), labels.to(device)
+                    outputs = model(imgs)
 
-            if val_f1 > best_f1 + 1e-4:
-                best_f1 = val_f1
-                best_acc = val_acc
-                torch.save(model.state_dict(), best_checkpoint)
-                patience_counter = 0
-            else:
-                patience_counter += 1
+                optimizer.zero_grad()
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
 
-            if epoch + 1 >= min_epochs and patience_counter >= patience:
-                print(f"  > Fold {fold} -> Early stopping at epoch {epoch + 1} | Best Val Acc: {best_acc:.4f} | Best Macro F1: {best_f1:.4f}")
-                break
-        else:
-            print(f"  > Fold {fold} -> Completed {epochs} epochs | Best Val Acc: {best_acc:.4f} | Best Macro F1: {best_f1:.4f}")
+                train_loss += loss.item() * len(labels)
+                train_correct += (outputs.argmax(1) == labels).sum().item()
+                train_total += len(labels)
 
-        fold_f1s.append(best_f1)
+            # Validation phase
+            model.eval()
+            val_loss, val_correct, val_total = 0.0, 0, 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    if tab_cols:
+                        imgs, tabs, labels = batch
+                        imgs, tabs, labels = imgs.to(device), tabs.to(device), labels.to(device)
+                        outputs = model(imgs, tabs)
+                    else:
+                        imgs, labels = batch
+                        imgs, labels = imgs.to(device), labels.to(device)
+                        outputs = model(imgs)
 
-    mean_f1 = float(np.mean(fold_f1s))
-    std_f1 = float(np.std(fold_f1s))
-    print(f"[{species.upper()} STATISTICAL SUMMARY] Mean Macro F1: {mean_f1:.4f} (±{std_f1:.4f})")
+                    loss = criterion(outputs, labels)
+                    val_loss += loss.item() * len(labels)
+                    val_correct += (outputs.argmax(1) == labels).sum().item()
+                    val_total += len(labels)
+
+            train_acc = train_correct / train_total * 100
+            val_acc = val_correct / val_total * 100
+            print(f"Epoch {epoch+1:02d}/{epochs:02d} | Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}% | Val Loss: {val_loss/val_total:.4f}")
+
+            if val_acc >= best_val_acc:
+                best_val_acc = val_acc
+                torch.save(model.state_dict(), ckpt_path)
+
+        print(f"Fold {fold} Best Val Accuracy: {best_val_acc:.2f}% (Saved to {ckpt_path.name})")
 
 if __name__ == "__main__":
-    for species in ["fish", "shrimp"]:
-        run_cross_validation(species=species, epochs=25, patience=5, min_epochs=10)
+    parser = argparse.ArgumentParser(description="Train AquaVision multi-backbone models.")
+    parser.add_argument("--species", type=str, default="fish", choices=["fish", "shrimp"], help="Target species")
+    parser.add_argument("--backbones", nargs="+", default=["resnet18"], help="List of backbones to train (e.g. resnet18 efficientnet_b0 vit_b_16)")
+    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs per fold")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    args = parser.parse_args()
+
+    for backbone in args.backbones:
+        train_cross_validation(
+            species=args.species,
+            backbone_name=backbone,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr
+        )
