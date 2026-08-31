@@ -24,8 +24,6 @@ class AquaMultimodalDataset(Dataset):
         self.tab_cols = tab_cols or []
         self.transform = transform
         self.species = species
-        
-        # Maps string labels to integer indices
         self.label_map = {lbl: idx for idx, lbl in enumerate(sorted(self.df["label"].unique()))}
 
     def __len__(self):
@@ -34,7 +32,7 @@ class AquaMultimodalDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         img_path = self.img_dir / row["image_path"]
-        
+
         img = cv2.imread(str(img_path))
         if img is None:
             img = np.zeros((224, 224, 3), dtype=np.uint8)
@@ -50,15 +48,15 @@ class AquaMultimodalDataset(Dataset):
             img_tensor = ToTensorV2()(image=img_resized)["image"]
 
         label_idx = self.label_map[row["label"]]
-        
+
         if self.tab_cols:
             tab_values = row[self.tab_cols].values.astype(np.float32)
             return img_tensor, torch.tensor(tab_values, dtype=torch.float32), torch.tensor(label_idx, dtype=torch.long)
-        
+
         return img_tensor, torch.tensor(label_idx, dtype=torch.long)
 
 
-def train_cross_validation(species="fish", backbone_name="resnet18", epochs=5, batch_size=16, lr=1e-4):
+def train_cross_validation(species="fish", backbone_name="resnet18", epochs=25, patience=5, min_epochs=10, batch_size=16, lr=3e-4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n==================================================")
     print(f" Starting Training: Species={species.upper()} | Backbone={backbone_name} | Device={device}")
@@ -66,16 +64,22 @@ def train_cross_validation(species="fish", backbone_name="resnet18", epochs=5, b
 
     processed_dir = Path("datasets/processed")
     manifest_path = processed_dir / f"{species}_processed_manifest.csv"
-    
+
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
     df = pd.read_csv(manifest_path)
     img_dir = processed_dir / species
-    
+
     tab_cols = [c for c in ["temperature", "ph", "dissolved_oxygen", "ammonia", "temp_do_ratio", "ammonia_toxicity_index", "stress_score"] if c in df.columns]
     num_classes = len(df["label"].unique())
-    folds = sorted([f for f in df["fold"].unique() if f >= 0])
+
+    # CRITICAL: strictly isolate train/val data from the held-out test set.
+    # fold == -1 marks rows carved out by rebuild_manifests.py as the
+    # zero-leakage evaluation set -- they must never appear in training or
+    # validation for ANY fold.
+    cv_df = df[df["fold"] >= 0].copy()
+    folds = sorted(cv_df["fold"].unique())
 
     transform_train = A.Compose([
         A.HorizontalFlip(p=0.5),
@@ -94,16 +98,15 @@ def train_cross_validation(species="fish", backbone_name="resnet18", epochs=5, b
 
     for fold in folds:
         print(f"\n--- Fold {fold} ({species} - {backbone_name}) ---")
-        train_df = df[df["fold"] != fold].copy()
-        val_df = df[df["fold"] == fold].copy()
+        train_df = cv_df[cv_df["fold"] != fold].copy()
+        val_df = cv_df[cv_df["fold"] == fold].copy()
 
-        # Fit scalar for tabular data per fold (backbone-agnostic filename)
         scaler = None
         if tab_cols:
             scaler = StandardScaler()
             train_df[tab_cols] = scaler.fit_transform(train_df[tab_cols])
             val_df[tab_cols] = scaler.transform(val_df[tab_cols])
-            
+
             scaler_path = checkpoints_dir / f"{species}_scaler_fold{fold}.pkl"
             joblib.dump(scaler, scaler_path)
 
@@ -122,15 +125,16 @@ def train_cross_validation(species="fish", backbone_name="resnet18", epochs=5, b
 
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
         best_val_acc = 0.0
-        # Dynamic backbone-aware checkpoint path
+        patience_counter = 0
         ckpt_path = checkpoints_dir / f"{species}_{backbone_name}_best_model_fold{fold}.pt"
 
         for epoch in range(epochs):
             model.train()
             train_loss, train_correct, train_total = 0.0, 0, 0
-            
+
             for batch in train_loader:
                 if tab_cols:
                     imgs, tabs, labels = batch
@@ -150,7 +154,6 @@ def train_cross_validation(species="fish", backbone_name="resnet18", epochs=5, b
                 train_correct += (outputs.argmax(1) == labels).sum().item()
                 train_total += len(labels)
 
-            # Validation phase
             model.eval()
             val_loss, val_correct, val_total = 0.0, 0, 0
             with torch.no_grad():
@@ -173,9 +176,18 @@ def train_cross_validation(species="fish", backbone_name="resnet18", epochs=5, b
             val_acc = val_correct / val_total * 100
             print(f"Epoch {epoch+1:02d}/{epochs:02d} | Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}% | Val Loss: {val_loss/val_total:.4f}")
 
+            scheduler.step()
+
             if val_acc >= best_val_acc:
                 best_val_acc = val_acc
+                patience_counter = 0
                 torch.save(model.state_dict(), ckpt_path)
+            else:
+                patience_counter += 1
+
+            if epoch + 1 >= min_epochs and patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch+1} (no improvement for {patience} epochs, min_epochs={min_epochs} satisfied).")
+                break
 
         print(f"Fold {fold} Best Val Accuracy: {best_val_acc:.2f}% (Saved to {ckpt_path.name})")
 
@@ -183,9 +195,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train AquaVision multi-backbone models.")
     parser.add_argument("--species", type=str, default="fish", choices=["fish", "shrimp"], help="Target species")
     parser.add_argument("--backbones", nargs="+", default=["resnet18"], help="List of backbones to train (e.g. resnet18 efficientnet_b0 vit_b_16)")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs per fold")
+    parser.add_argument("--epochs", type=int, default=25, help="Max training epochs per fold (early stopping may end sooner)")
+    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience (epochs without val improvement)")
+    parser.add_argument("--min-epochs", type=int, default=10, help="Minimum epochs before early stopping can trigger")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     args = parser.parse_args()
 
     for backbone in args.backbones:
@@ -193,6 +207,8 @@ if __name__ == "__main__":
             species=args.species,
             backbone_name=backbone,
             epochs=args.epochs,
+            patience=args.patience,
+            min_epochs=args.min_epochs,
             batch_size=args.batch_size,
             lr=args.lr
         )

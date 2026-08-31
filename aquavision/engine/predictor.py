@@ -50,12 +50,11 @@ class AquaPredictor:
         # --- 3. LOAD MULTIMODAL DIAGNOSTIC MODEL ---
         checkpoint_path = Path("checkpoints") / f"{self.species}_{self.backbone_name}_best_model_fold{self.fold}.pt"
         if not checkpoint_path.exists():
-            legacy_path = Path("checkpoints") / f"{self.species}_best_model_fold{self.fold}.pt"
-            if legacy_path.exists():
-                checkpoint_path = legacy_path
-
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Model checkpoint not found at: {checkpoint_path}")
+            raise FileNotFoundError(
+                f"No checkpoint found for species='{self.species}', backbone='{self.backbone_name}', fold={self.fold} "
+                f"at {checkpoint_path}. Train this species/backbone/fold combination before serving it, or update "
+                f"checkpoints/production_model_registry.json to point at a backbone/fold that has been trained."
+            )
 
         self.model = AquaVisionMultimodalModel(
             num_classes=len(self.classes),
@@ -148,3 +147,4 @@ class AquaPredictor:
             "is_mismatch": False,
             "backbone_used": self.backbone_name
         }
+
