@@ -49,6 +49,52 @@
                 <div id="dynamic-models" class="overflow-x-auto"></div>
             </div>
 
+            <div class="border-t border-slate-700 pt-8">
+                <h2 class="text-2xl font-black text-white mb-1"><i class="fas fa-satellite-dish text-amber-400 mr-2"></i>Live Diagnostics</h2>
+                <p class="text-slate-400 text-sm mb-6">Real-world /test submissions. Unverified model predictions -- shown separately from the labeled training data above.</p>
+
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+                    <div class="bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                        <p class="text-xs font-bold text-slate-400 uppercase tracking-wider">Total Submissions</p>
+                        <h2 id="live-kpi-total" class="text-4xl font-black text-amber-400 mt-2">0</h2>
+                    </div>
+                    <div class="bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                        <p class="text-xs font-bold text-slate-400 uppercase tracking-wider">Species Mismatch Rate</p>
+                        <h2 id="live-kpi-mismatch" class="text-4xl font-black text-red-400 mt-2">0%</h2>
+                    </div>
+                    <div class="bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                        <p class="text-xs font-bold text-slate-400 uppercase tracking-wider">Avg. Confidence</p>
+                        <h2 id="live-kpi-confidence" class="text-4xl font-black text-emerald-400 mt-2">0%</h2>
+                    </div>
+                    <div class="bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                        <p class="text-xs font-bold text-slate-400 uppercase tracking-wider">Species Breakdown</p>
+                        <h2 id="live-kpi-species" class="text-lg font-black text-brand mt-3">--</h2>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
+                    <div class="bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                        <h4 class="text-sm font-bold text-slate-400 mb-4 text-center">Predicted Class Distribution (Live)</h4>
+                        <div class="h-64"><canvas id="liveClassChart"></canvas></div>
+                    </div>
+                    <div class="bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                        <h4 class="text-sm font-bold text-slate-400 mb-4 text-center">Submissions Over Time (Cumulative)</h4>
+                        <div class="h-64"><canvas id="liveTimelineChart"></canvas></div>
+                    </div>
+                    <div class="bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                        <h4 class="text-sm font-bold text-slate-400 mb-4 text-center">Confidence Distribution</h4>
+                        <div class="h-64"><canvas id="liveConfidenceChart"></canvas></div>
+                    </div>
+                </div>
+
+                <div class="bg-cardbg p-6 rounded-2xl border border-slate-700 shadow-xl">
+                    <h4 class="text-sm font-bold text-slate-400 mb-4"><i class="fas fa-images mr-2"></i>Recent Submissions</h4>
+                    <div id="live-gallery" class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                        <p class="col-span-full text-slate-500 italic text-center py-6">No live submissions yet -- run a diagnosis on /test to populate this.</p>
+                    </div>
+                </div>
+            </div>
+
         </div>
 
         <script>
@@ -143,7 +189,64 @@
                     console.error("Error loading dashboard data:", error);
                 }
             }
-            window.onload = fetchMetrics;
+
+            async function fetchLiveMetrics() {
+                try {
+                    const response = await fetch('/admin/api/live-metrics');
+                    const DATA = await response.json();
+
+                    document.getElementById('live-kpi-total').innerText = DATA.total_submissions.toLocaleString();
+                    document.getElementById('live-kpi-mismatch').innerText = DATA.mismatch_rate + '%';
+                    document.getElementById('live-kpi-confidence').innerText = DATA.avg_confidence + '%';
+
+                    const speciesText = Object.entries(DATA.species_breakdown).map(([k, v]) => `${k}: ${v}`).join(' / ') || '--';
+                    document.getElementById('live-kpi-species').innerText = speciesText;
+
+                    if (DATA.total_submissions === 0) return;
+
+                    new Chart(document.getElementById('liveClassChart').getContext('2d'), {
+                        type: 'bar',
+                        data: {
+                            labels: Object.keys(DATA.class_distribution),
+                            datasets: [{ label: 'Predictions', data: Object.values(DATA.class_distribution), backgroundColor: '#0ea5e9' }]
+                        },
+                        options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#cbd5e1' } }, y: { ticks: { color: '#cbd5e1' } } } }
+                    });
+
+                    new Chart(document.getElementById('liveTimelineChart').getContext('2d'), {
+                        type: 'line',
+                        data: {
+                            labels: DATA.timeline.map(t => t.date),
+                            datasets: [{ label: 'Cumulative Submissions', data: DATA.timeline.map(t => t.cumulative), borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,0.15)', fill: true, tension: 0.3 }]
+                        },
+                        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#cbd5e1' } } }, scales: { x: { ticks: { color: '#cbd5e1' } }, y: { ticks: { color: '#cbd5e1' }, beginAtZero: true } } }
+                    });
+
+                    new Chart(document.getElementById('liveConfidenceChart').getContext('2d'), {
+                        type: 'bar',
+                        data: {
+                            labels: Object.keys(DATA.confidence_histogram),
+                            datasets: [{ label: 'Submissions', data: Object.values(DATA.confidence_histogram), backgroundColor: '#10b981' }]
+                        },
+                        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#cbd5e1' } }, y: { ticks: { color: '#cbd5e1' }, beginAtZero: true } } }
+                    });
+
+                    const gallery = document.getElementById('live-gallery');
+                    gallery.innerHTML = DATA.recent_submissions.map(s => `
+                        <div class="bg-slate-800 rounded-xl overflow-hidden border ${s.is_mismatch ? 'border-red-500/50' : 'border-slate-700'}">
+                            <img src="${s.thumbnail_url}" class="w-full h-28 object-cover" loading="lazy">
+                            <div class="p-2">
+                                <p class="text-xs font-bold ${s.is_mismatch ? 'text-red-400' : 'text-white'} truncate">${s.prediction}</p>
+                                <p class="text-[10px] text-slate-400">${s.confidence !== null ? s.confidence + '% conf.' : s.species}</p>
+                            </div>
+                        </div>
+                    `).join('');
+                } catch (error) {
+                    console.error("Error loading live metrics:", error);
+                }
+            }
+
+            window.addEventListener('load', () => { fetchMetrics(); fetchLiveMetrics(); });
         </script>
     </body>
     </html>

@@ -19,3 +19,7 @@ def get_metrics_api():
         "dataset_metrics": engine.get_dataset_metrics(),
         "model_metrics": engine.get_model_metrics()
     }
+
+@admin_router.get("/api/live-metrics")
+def get_live_metrics_api():
+    return engine.get_live_metrics()

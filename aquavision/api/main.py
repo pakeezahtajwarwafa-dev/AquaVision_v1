@@ -3,9 +3,12 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
 from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from aquavision.api.admin.router import admin_router
 from aquavision.engine.predictor import AquaPredictor
+from aquavision.live_log import log_live_submission
 
 app = FastAPI(
     title="AquaVision BD Diagnostic API Engine",
@@ -22,6 +25,13 @@ app.add_middleware(
 )
 
 app.include_router(admin_router)
+
+# Serve live-submission thumbnails for the dashboard gallery. Must be
+# mounted on the app itself, not the router -- Starlette does not
+# propagate router-level mounts through app.include_router().
+_thumbnails_dir = Path("outputs/live_submissions/thumbnails")
+_thumbnails_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/admin/thumbnails", StaticFiles(directory=str(_thumbnails_dir)), name="live-thumbnails")
 
 # In-memory cache to prevent reloading heavy PyTorch weights on every API call
 _model_cache = {}
@@ -61,6 +71,13 @@ async def process_multimodal_prediction(
         
         predictor = get_cached_predictor(species)
         results = predictor.predict(img_rgb, wq_dict)
+
+        try:
+            log_live_submission(img_rgb, species, results, wq_dict)
+        except Exception as log_err:
+            # Never let telemetry logging break an actual diagnosis response.
+            print(f"[WARN] Failed to log live submission: {log_err}")
+
         return results
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -238,3 +255,4 @@ def serve_rich_testing_ui():
     </html>
     """
     return HTMLResponse(content=html_content)
+

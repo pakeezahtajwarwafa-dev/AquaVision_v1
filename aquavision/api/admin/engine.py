@@ -94,3 +94,66 @@ class DynamicAnalyticsEngine:
                 artifacts["onnx_exports"][arch].append(onnx_file.name)
                 
         return artifacts
+
+    def get_live_metrics(self) -> Dict[str, Any]:
+        """
+        Aggregates the live /test submission log (aquavision/live_log.py)
+        for dashboard display. This is unverified model output, kept
+        deliberately separate from the labeled dataset metrics above.
+        """
+        from aquavision.live_log import load_live_log
+
+        df = load_live_log()
+        empty = {
+            "total_submissions": 0, "mismatch_count": 0, "mismatch_rate": 0,
+            "avg_confidence": 0, "class_distribution": {}, "species_breakdown": {},
+            "confidence_histogram": {}, "timeline": [], "recent_submissions": []
+        }
+        if df.empty:
+            return empty
+
+        total = len(df)
+        mismatch_count = int(df["is_mismatch"].sum())
+        valid_df = df[df["is_mismatch"] == False]
+        avg_conf = float(valid_df["confidence"].mean()) if len(valid_df) else 0.0
+
+        class_dist = valid_df["prediction"].value_counts().to_dict()
+        species_breakdown = df["species"].value_counts().to_dict()
+
+        bins = [0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01]
+        labels = ["<50%", "50-60%", "60-70%", "70-80%", "80-90%", "90-100%"]
+        hist = {}
+        if len(valid_df):
+            cats = pd.cut(valid_df["confidence"], bins=bins, labels=labels, right=False)
+            hist = cats.value_counts().reindex(labels).fillna(0).astype(int).to_dict()
+
+        df["date"] = pd.to_datetime(df["timestamp"]).dt.date.astype(str)
+        daily_counts = df.groupby("date").size().sort_index()
+        cumulative = daily_counts.cumsum()
+        timeline = [{"date": d, "cumulative": int(c)} for d, c in cumulative.items()]
+
+        recent = df.sort_values("timestamp", ascending=False).head(12)
+        recent_list = []
+        for _, r in recent.iterrows():
+            recent_list.append({
+                "submission_id": r["submission_id"],
+                "timestamp": r["timestamp"],
+                "species": r["species"],
+                "is_mismatch": bool(r["is_mismatch"]),
+                "prediction": "Species Mismatch" if r["is_mismatch"] else r["prediction"],
+                "confidence": None if r["is_mismatch"] or pd.isna(r["confidence"]) else round(float(r["confidence"]) * 100, 1),
+                "thumbnail_url": f"/admin/thumbnails/{r['thumbnail_filename']}"
+            })
+
+        return {
+            "total_submissions": total,
+            "mismatch_count": mismatch_count,
+            "mismatch_rate": round(mismatch_count / total * 100, 1) if total else 0,
+            "avg_confidence": round(avg_conf * 100, 1),
+            "class_distribution": class_dist,
+            "species_breakdown": species_breakdown,
+            "confidence_histogram": hist,
+            "timeline": timeline,
+            "recent_submissions": recent_list
+        }
+
